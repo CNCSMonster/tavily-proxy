@@ -8,7 +8,7 @@
 /// Token prefixes known to identify credentials: Tavily's own (`tvly-`,
 /// including `tvly-dev-`), this proxy's keys (`tp-`), and the `sk-` style that
 /// OpenAI-compatible chat services hand out.
-const SECRET_PREFIXES: [&str; 3] = ["tvly-", "tp-", "sk-"];
+const SECRET_PREFIXES: [&str; 4] = ["tvly-", "tp-", "sk-", "jev-"];
 
 /// Shortest token body worth hiding; keeps the redactor from mangling ordinary
 /// hyphenated prose such as `tp-link` or `output-`.
@@ -80,7 +80,7 @@ pub fn redact_literals(input: &str, values: &[&str]) -> String {
 ///
 /// Needed where a parse error has to be scrubbed *before* the config could be
 /// parsed: by definition the parsed values do not exist yet, so they are read off
-/// the text by key name.
+/// the text by key name first.
 pub fn literal_secrets_in_toml(text: &str) -> Vec<String> {
     const KEY_NAMES: [&str; 4] = ["key", "api_key", "tavily_key", "proxy_key"];
 

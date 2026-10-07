@@ -1,0 +1,15 @@
+[package]
+name = "tavily-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tavily-core = { path = "../tavily-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+tower = { workspace = true }
+libc = { workspace = true }

@@ -1,0 +1,43 @@
+# tavily-proxy systemd unit —— 复制即用，改路径后安装：
+#   sudo install -m 644 deploy/tavily-proxy.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tavily-proxy
+#
+# 路径约定（与 README「部署」一节一致）：
+#   二进制 /usr/local/bin/tavily-proxy
+#   配置   /etc/tavily-proxy/config.toml
+#   环境   /etc/tavily-proxy/env        （检查器 key，KEY=value，chmod 600）
+#   指标   /var/lib/tavily-proxy/metrics.jsonl
+#
+# 用 systemd 就不要用 `serve --background`（setsid 会脱离 systemd 管理，
+# 崩了不自拉、开机不自启）；systemd 下一律用 systemctl status|stop|restart。
+
+[Unit]
+Description=Tavily API proxy
+Documentation=https://github.com/CNCSMonster/tavily-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 前台模式（systemd 就是进程管理器）；SIGTERM 优雅退出已实现，systemctl stop 可用
+ExecStart=/usr/local/bin/tavily-proxy --config /etc/tavily-proxy/config.toml serve
+
+# 检查器 key（[filter] 的 api_key_env）在此注入，KEY=value 一行一个；未启用检查器可整行删掉
+# （`-` 前缀 = 文件不存在也不报错）
+EnvironmentFile=-/etc/tavily-proxy/env
+
+# 指标落盘：默认 target/metrics.jsonl 是相对 CWD 的路径，systemd 下不可写，必须显式指定。
+# 置成空值（METRICS_FILE=）则禁用文件指标。以专用用户运行时先 mkdir/chown 该目录
+Environment=METRICS_FILE=/var/lib/tavily-proxy/metrics.jsonl
+
+# 可选：专用非特权用户（先 useradd -r tavily-proxy 并给上面 env / 指标目录授权）
+# User=tavily-proxy
+# Group=tavily-proxy
+
+Restart=on-failure
+RestartSec=3
+
+# 本服务自身无 TLS：只监听回环，由反代终结 TLS（见 deploy/Caddyfile / deploy/nginx.conf）
+
+[Install]
+WantedBy=multi-user.target

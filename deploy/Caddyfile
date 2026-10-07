@@ -1,0 +1,11 @@
+# Caddy 反代模板 —— 自动申请并续期 TLS 证书（把 80/443 放行给 Caddy 即可）。
+#
+# 用法：把域名改成你的，然后
+#   sudo install -m 644 deploy/Caddyfile /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# 调用方 --TLS--> Caddy --回环明文--> 127.0.0.1:3456（不出网卡，key 不裸传）
+
+your.domain.example {
+	reverse_proxy 127.0.0.1:3456
+}

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::Config;
+use tavily_core::config::Config;
 
 const APP_DIR: &str = "tavily-proxy";
 const PID_FILE: &str = "tavily-proxy.pid";

@@ -1,36 +1,30 @@
-mod handler;
-
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use axum::Router;
-use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, post};
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use tavily_proxy::config::Config;
-use tavily_proxy::core::ProxyCore;
-use tavily_proxy::service;
-
-/// Cap on a single request body. Tavily payloads are a few KiB; the limit exists
-/// so an unauthenticated peer cannot make the proxy buffer unbounded input.
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+use tavily_core::config::Config;
+use tavily_core::core::ProxyCore;
+use tavily_core::key_pool::mask_key;
+use tavily_server::service;
 
 const USAGE: &str = "\
 tavily-proxy — Tavily API 中转服务
 
 USAGE:
     tavily-proxy [serve] [--foreground|--background] [--config <path>]
+    tavily-proxy check [--config <path>]
     tavily-proxy status  [--config <path>]
     tavily-proxy stop    [--config <path>]
     tavily-proxy restart [--config <path>]
 
 COMMANDS:
     serve       运行代理服务（默认前台）
+    check       预检配置：只加载校验，不监听、不联网、不碰 pid（重启前先跑这个）
     status      查看后台服务状态
     stop        停止后台服务
     restart     重启后台服务（= stop + serve --background）
@@ -41,11 +35,14 @@ OPTIONS:
     -c, --config <path>  配置文件路径（默认 $TAVILY_PROXY_CONFIG 或 ./config.toml）
     -h, --help           显示本帮助
 
+退出码：check 为 0=配置可用、1=配置有误；其余命令 0=成功。
+
 服务只往 stdout 写日志；落哪个文件、要不要轮转，由运行环境决定（见 README「日志」）。
 ";
 
 enum Command {
     Serve { background: bool },
+    Check,
     Status,
     Stop,
     Restart,
@@ -72,6 +69,7 @@ fn main() -> anyhow::Result<()> {
     init_tracing();
 
     match cli.command {
+        Command::Check => check_config(&cli.config),
         Command::Status => service::status(&cli.config),
         Command::Stop => service::shutdown_background(&cli.config),
         Command::Restart => {
@@ -123,7 +121,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Option<Cli>>
             }
             "-f" | "--foreground" => foreground = true,
             "-b" | "--background" => background = true,
-            "serve" | "status" | "stop" | "restart" if command.is_none() => command = Some(arg),
+            "serve" | "check" | "status" | "stop" | "restart" if command.is_none() => {
+                command = Some(arg)
+            }
             other if other.starts_with('-') => bail!("unknown option {other}"),
             other => bail!("unknown command {other}"),
         }
@@ -134,6 +134,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Option<Cli>>
     }
 
     let command = match command.as_deref() {
+        Some("check") => Command::Check,
         Some("status") => Command::Status,
         Some("stop") => Command::Stop,
         Some("restart") => Command::Restart,
@@ -151,9 +152,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Option<Cli>>
 fn serve_foreground(config_path: &Path, config: &Config) -> anyhow::Result<()> {
     let listen = config.server.listen.clone();
     let core = Arc::new(ProxyCore::from_config(config)?);
+    warn_deprecations(config);
     info!(
         tavily_keys = core.key_pool.total_keys(),
         available = core.key_pool.available_keys(),
+        upstream_rpm = core.key_pool.rpm(),
         "key pool initialized"
     );
     log_filter_chain(&core);
@@ -164,6 +167,8 @@ fn serve_foreground(config_path: &Path, config: &Config) -> anyhow::Result<()> {
         .context("failed to build tokio runtime")?;
 
     runtime.block_on(async move {
+        core.auth.start_persistence_worker();
+
         // Bind before publishing the pid: a port clash must not leave a pid file
         // pointing at a process that never served.
         let listener = TcpListener::bind(&listen)
@@ -174,14 +179,93 @@ fn serve_foreground(config_path: &Path, config: &Config) -> anyhow::Result<()> {
         service::claim_pid(pid, config_path)?;
         info!(%listen, pid, "tavily-proxy listening");
 
-        let app = build_router(core);
+        let app = tavily_server::router(Arc::clone(&core));
         let result = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await;
 
+        core.auth.flush_quota_sync();
         service::revoke_pid_file_if_owned(pid);
         result.with_context(|| format!("server stopped with an error on {listen}"))
     })
+}
+
+/// Warn about deprecated fields the config still uses. Shared by `serve` and
+/// `check`: one release of warnings before the fields are refused outright.
+fn warn_deprecations(config: &Config) {
+    for warning in config.deprecations() {
+        warn!("{warning}");
+    }
+}
+
+/// `check`: run exactly what `serve` runs before it binds — strict parse,
+/// validation, filter-chain and key-pool construction — then report and stop.
+///
+/// No socket, no pid file, no request to Tavily. It exists because a config with
+/// a typo in it now refuses to start, so "restart and hope" is no longer a safe
+/// upgrade step: run this first (README「升级」).
+fn check_config(path: &Path) -> anyhow::Result<()> {
+    let built = Config::load(path)
+        .and_then(|config| ProxyCore::from_config(&config).map(|core| (config, core)));
+    let (config, core) = match built {
+        Ok(pair) => pair,
+        Err(err) => {
+            // `Config::load` scrubs credential-shaped text out of parse errors,
+            // so this line is safe to print and safe to leave in a journal.
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    let (rpm, rpm_source) = config.upstream_budget();
+    println!("config: {}", path.display());
+    println!("listen: {}", config.server.listen);
+    println!("upstream rpm: {rpm}（{rpm_source}；0 = 不限速）");
+    println!(
+        "tavily keys: {} 把（当前可用 {}）",
+        core.key_pool.total_keys(),
+        core.key_pool.available_keys()
+    );
+    for key in config.flatten_keys() {
+        let limit = match key.max_requests {
+            Some(max) => format!("实例累计上限 {max}"),
+            None => "实例累计上限 无".to_string(),
+        };
+        println!("  - {} {limit}", mask_key(&key.key));
+    }
+    println!("proxy keys: {} 个调用方", config.proxy_keys.len());
+    for (index, caller) in config.proxy_keys.iter().enumerate() {
+        let label = caller
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("unnamed#{}", index + 1));
+        let month = match caller.max_requests_per_month {
+            Some(max) => max.to_string(),
+            None => "无".to_string(),
+        };
+        let rpm = match caller.rpm {
+            Some(value) => value.to_string(),
+            None => "无".to_string(),
+        };
+        let concurrency = match caller.max_concurrency {
+            Some(value) => value.to_string(),
+            None => "无".to_string(),
+        };
+        println!("  - {label}: 月度配额 {month}, rpm {rpm}, 并发 {concurrency}");
+    }
+    if core.filters.is_empty() {
+        println!("filter: 未启用（无 enabled [[filter.rules]]）");
+    } else {
+        println!("filter: 规则 {:?}", core.filters.names());
+    }
+    for (label, rules) in &core.filter_routes {
+        println!("  - 审查路由 {label}: {rules}");
+    }
+    for warning in config.deprecations() {
+        println!("弃用告警: {warning}");
+    }
+    println!("check: 通过（未监听、未联网）");
+    Ok(())
 }
 
 /// Say plainly whether filtering is on: an absent `[filter]` section is easy to
@@ -192,21 +276,29 @@ fn log_filter_chain(core: &ProxyCore) {
     } else {
         info!(
             rules = ?core.filters.names(),
+            stages = ?core
+                .filters
+                .stages()
+                .iter()
+                .map(|stage| stage.as_str())
+                .collect::<Vec<_>>(),
+            capabilities = ?core
+                .filters
+                .capabilities()
+                .iter()
+                .map(|(name, support)| format!("{name}({})", support.describe()))
+                .collect::<Vec<_>>(),
             block_threshold = core.filters.block_threshold(),
             output_block = ?core.filters.output_block(),
             scan_raw_content = core.filters.scan_raw_content(),
             "content safety chain initialized"
         );
     }
-}
-
-fn build_router(core: Arc<ProxyCore>) -> Router {
-    Router::new()
-        .route("/search", post(handler::handle_search))
-        .route("/extract", post(handler::handle_extract))
-        .route("/health", get(handler::handle_health))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(core)
+    // Per-token routes (ISSUE-0006): which token judges with which rules.
+    // `key_name` is a label (config name or position) — never the key itself.
+    for (label, rules) in &core.filter_routes {
+        info!(key_name = %label, rules = %rules, "filter route configured");
+    }
 }
 
 async fn shutdown_signal() {

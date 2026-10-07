@@ -1,2 +1,5 @@
-/target
+target/
 config.toml
+# 实验记录已迁往工作区 tavily-proxy-docs/experiments/（独立文档仓，入库）；
+# 本行仅是防误放护栏——实验文档不要写进代码仓
+docs/experiments/

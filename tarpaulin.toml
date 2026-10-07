@@ -1,0 +1,10 @@
+[default]
+name = "tavily-proxy"
+timeout = "120s"
+run_types = ["Tests"]
+out = ["Stdout"]
+
+# Exclude standalone main binary CLI glue
+exclude-files = [
+    "src/main.rs",
+]
