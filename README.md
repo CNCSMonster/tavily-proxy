@@ -102,6 +102,32 @@ tavily-proxy restart              # 重启（改完 config.toml 后用这个）
 
 服务器上通过 SSH 启动后进程会在登出后继续运行（`setsid` 已与终端断开）。
 
+## 容器运行 (Docker)
+
+官方提供经过轻量裁剪与权限加固的多架构 Docker 镜像（以非 root 用户 `appuser:10001` 运行）：
+
+```bash
+# 1. 从 GHCR 拉取预构建镜像
+docker pull ghcr.io/cncsmonster/tavily-proxy:latest
+
+# 2. 挂载本地配置文件启动容器（注意：config.toml 内 listen 请设为 "0.0.0.0:3456" 以便端口映射）
+docker run -d \
+  --name tavily-proxy \
+  --restart unless-stopped \
+  -p 3456:3456 \
+  -v $(pwd)/config.toml:/app/config.toml:ro \
+  ghcr.io/cncsmonster/tavily-proxy:latest
+
+# 3. 检查容器健康状态
+docker ps --filter name=tavily-proxy
+```
+
+本地自行构建镜像：
+
+```bash
+docker build -t tavily-proxy:latest .
+```
+
 ## 部署
 
 本机开发用上面「运行」一节即可；服务器部署的完整路径是
