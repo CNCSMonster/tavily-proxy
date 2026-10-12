@@ -8,7 +8,7 @@ use tracing::{error, info, warn};
 
 use crate::auth::{Auth, AuthResult};
 use crate::config::Config;
-use crate::egress::{DirectEgress, Egress, EgressOutcome};
+use crate::egress::{DirectEgress, Egress, EgressContext, EgressError, EgressOutcome};
 use crate::filter::{
     ChainResult, ChainVerdict, FilterChain, OutputBlockMode, ReportFiltered, ScanUnit, Stage,
 };
@@ -31,14 +31,38 @@ const CONNECT_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
 const DEFAULT_UPSTREAM_BASE: &str = "https://api.tavily.com";
 
+pub const UPSTREAM_MAX_QUERY_CHARS: usize = 1500;
+
 /// Which upstream endpoint a response came from.
 ///
 /// The two report a removed entry differently: `/extract` has an official field
 /// for "this URL produced nothing", `/search` has no equivalent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UpstreamEndpoint {
+pub enum UpstreamEndpoint {
     Search,
     Extract,
+    Crawl,
+    Map,
+    Research,
+    GetResearch,
+}
+
+impl UpstreamEndpoint {
+    /// 该端点的配额分类（ISSUE-0009）。
+    ///
+    /// `GET /research/{id}` 轮询本身不扣配额（成功路径不 commit），
+    /// 但上游 4xx 的兜底 commit 仍会发生，归入 research 以保持
+    /// 总账 = 各类之和的不变量。
+    pub fn usage_category(self) -> crate::quota::UsageCategory {
+        use crate::quota::UsageCategory;
+        match self {
+            UpstreamEndpoint::Search => UsageCategory::Search,
+            UpstreamEndpoint::Extract => UsageCategory::Extract,
+            UpstreamEndpoint::Crawl => UsageCategory::Crawl,
+            UpstreamEndpoint::Map => UsageCategory::Map,
+            UpstreamEndpoint::Research | UpstreamEndpoint::GetResearch => UsageCategory::Research,
+        }
+    }
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -82,6 +106,7 @@ pub struct ProxyCore {
 
 #[derive(Debug)]
 pub enum ProxyError {
+    BadRequest(String),
     Unauthorized(String),
     QuotaExceeded {
         key_name: Option<String>,
@@ -92,6 +117,10 @@ pub enum ProxyError {
         /// The filter's own message; forwarded to the caller as-is.
         message: String,
         confidence: f64,
+        /// 归因（ISSUE-0001）：触发本次入参拦截的 proxy key 名。
+        /// 只供结构化日志单行归因使用，绝不写入 `client_response`——
+        /// 哪个 key 触发拦截是运维信息，不随 Tavily 错误信封回给调用方。
+        proxy_key_name: Option<String>,
     },
     OutputBlocked {
         filter: String,
@@ -122,6 +151,10 @@ pub enum ProxyError {
     },
     NetworkError(String),
     ParseError(String),
+    Jailed {
+        escalation_level: u8,
+        unlock_in_secs: Option<u64>,
+    },
 }
 
 /// Tavily's one error shape: `{"detail":{"error":"..."}}`.
@@ -149,6 +182,7 @@ impl ProxyError {
     ///   the pooled credential on request.
     pub fn client_response(&self) -> (u16, Value) {
         match self {
+            ProxyError::BadRequest(message) => (400, detail_error(message.clone())),
             ProxyError::Unauthorized(message) => (401, detail_error(message.clone())),
             ProxyError::QuotaExceeded { key_name } => {
                 let suffix = key_name
@@ -201,6 +235,20 @@ impl ProxyError {
                 (502, detail_error("Failed to reach Tavily. Retry shortly."))
             }
             ProxyError::ParseError(_) => (502, detail_error("Failed to parse Tavily's response.")),
+            ProxyError::Jailed {
+                escalation_level,
+                unlock_in_secs,
+            } => {
+                let message = match unlock_in_secs {
+                    Some(secs) => format!(
+                        "Account temporarily jailed due to excessive invalid requests. Escalation Level: {escalation_level}. Unlock in: {secs}s. Please contact administrator if this is unexpected."
+                    ),
+                    None => format!(
+                        "Account permanently locked due to repeated excessive invalid requests. Escalation Level: {escalation_level}. Please contact administrator to restore access."
+                    ),
+                };
+                (403, detail_error(message))
+            }
         }
     }
 
@@ -237,6 +285,19 @@ impl ProxyCore {
         let quota_path = config.resolve_quota_path();
         let retention_days = config.retention_days();
         let max_file_size_bytes = config.max_file_size_bytes();
+        // Bench/test hook (ISSUE-0016): point the pool at a local mock upstream
+        // instead of api.tavily.com. Never set this in production.
+        let upstream_base = match std::env::var("TAVILY_UPSTREAM_BASE") {
+            Ok(base) if !base.trim().is_empty() => {
+                let base = base.trim().trim_end_matches('/').to_string();
+                tracing::warn!(
+                    base = %base,
+                    "TAVILY_UPSTREAM_BASE override active (bench/test only — never set in production)"
+                );
+                base
+            }
+            _ => DEFAULT_UPSTREAM_BASE.to_string(),
+        };
         Ok(Self {
             key_pool: KeyPool::from_config(config),
             auth: Arc::new(Auth::new_with_options(
@@ -250,7 +311,7 @@ impl ProxyCore {
             filter_routes,
             egress: Arc::new(DirectEgress::new()?),
             stats: Arc::new(ServerStats::default()),
-            upstream_base: DEFAULT_UPSTREAM_BASE.to_string(),
+            upstream_base,
         })
     }
 
@@ -289,6 +350,13 @@ impl ProxyCore {
                 "Unauthorized: missing or invalid API key.".into(),
             )),
             AuthResult::QuotaExceeded { name } => Err(ProxyError::QuotaExceeded { key_name: name }),
+            AuthResult::Jailed {
+                escalation_level,
+                unlock_in_secs,
+            } => Err(ProxyError::Jailed {
+                escalation_level,
+                unlock_in_secs,
+            }),
         }
     }
 
@@ -299,6 +367,35 @@ impl ProxyCore {
 
     pub async fn extract(&self, proxy_key: &str, body: Value) -> Result<ProxyResponse, ProxyError> {
         self.proxy_request(proxy_key, body, "/extract", UpstreamEndpoint::Extract)
+            .await
+    }
+
+    pub async fn crawl(&self, proxy_key: &str, body: Value) -> Result<ProxyResponse, ProxyError> {
+        self.proxy_request(proxy_key, body, "/crawl", UpstreamEndpoint::Crawl)
+            .await
+    }
+
+    pub async fn map(&self, proxy_key: &str, body: Value) -> Result<ProxyResponse, ProxyError> {
+        self.proxy_request(proxy_key, body, "/map", UpstreamEndpoint::Map)
+            .await
+    }
+
+    pub async fn research(
+        &self,
+        proxy_key: &str,
+        body: Value,
+    ) -> Result<ProxyResponse, ProxyError> {
+        self.proxy_request(proxy_key, body, "/research", UpstreamEndpoint::Research)
+            .await
+    }
+
+    pub async fn get_research(
+        &self,
+        proxy_key: &str,
+        request_id: &str,
+    ) -> Result<ProxyResponse, ProxyError> {
+        let path = format!("/research/{request_id}");
+        self.proxy_get_request(proxy_key, &path, UpstreamEndpoint::GetResearch)
             .await
     }
 
@@ -316,7 +413,14 @@ impl ProxyCore {
         };
 
         let res = self
-            .proxy_request_inner(proxy_key, &mut body, upstream_path, endpoint, &mut timing)
+            .proxy_request_inner(
+                proxy_key,
+                reqwest::Method::POST,
+                Some(&mut body),
+                upstream_path,
+                endpoint,
+                &mut timing,
+            )
             .await;
 
         timing.total_ms = start_total.elapsed().as_millis() as u64;
@@ -324,6 +428,7 @@ impl ProxyCore {
         match &res {
             Ok(_) => {
                 self.record_metrics_event(&timing, 200, upstream_path, None);
+                self.auth.record_success(proxy_key);
             }
             Err(err) => {
                 let (status, _) = err.client_response();
@@ -333,6 +438,56 @@ impl ProxyCore {
                     upstream_path,
                     Some(&format!("{err:?}")),
                 );
+                if (400..500).contains(&status) && status != 401 && status != 403 {
+                    self.auth.record_bad_request(proxy_key);
+                }
+            }
+        }
+
+        res
+    }
+
+    async fn proxy_get_request(
+        &self,
+        proxy_key: &str,
+        upstream_path: &str,
+        endpoint: UpstreamEndpoint,
+    ) -> Result<ProxyResponse, ProxyError> {
+        let start_total = Instant::now();
+        let mut timing = RequestTiming {
+            egress: Some(self.egress.name().to_string()),
+            ..Default::default()
+        };
+
+        let res = self
+            .proxy_request_inner(
+                proxy_key,
+                reqwest::Method::GET,
+                None,
+                upstream_path,
+                endpoint,
+                &mut timing,
+            )
+            .await;
+
+        timing.total_ms = start_total.elapsed().as_millis() as u64;
+
+        match &res {
+            Ok(_) => {
+                self.record_metrics_event(&timing, 200, upstream_path, None);
+                self.auth.record_success(proxy_key);
+            }
+            Err(err) => {
+                let (status, _) = err.client_response();
+                self.record_metrics_event(
+                    &timing,
+                    status,
+                    upstream_path,
+                    Some(&format!("{err:?}")),
+                );
+                if (400..500).contains(&status) && status != 401 && status != 403 {
+                    self.auth.record_bad_request(proxy_key);
+                }
             }
         }
 
@@ -342,16 +497,32 @@ impl ProxyCore {
     async fn proxy_request_inner(
         &self,
         proxy_key: &str,
-        body: &mut Value,
+        method: reqwest::Method,
+        mut body: Option<&mut Value>,
         upstream_path: &str,
         endpoint: UpstreamEndpoint,
         timing: &mut RequestTiming,
     ) -> Result<ProxyResponse, ProxyError> {
-        let _key_name = self.authenticate(proxy_key)?;
+        let key_name = self.authenticate(proxy_key)?;
+
+        if endpoint == UpstreamEndpoint::Search
+            && let Some(b) = body.as_ref()
+            && let Some(query) = b.get("query").and_then(|v| v.as_str())
+            && query.chars().count() > UPSTREAM_MAX_QUERY_CHARS
+        {
+            return Err(ProxyError::BadRequest(
+                "Query is too long. Max query length is 1500 characters.".into(),
+            ));
+        }
+
         let chain = self.chain_for(proxy_key);
         let mut guard = self
             .auth
-            .acquire_slot(proxy_key, Duration::from_secs(MAX_SAME_KEY_429_WAIT_SECS))
+            .acquire_slot(
+                proxy_key,
+                endpoint.usage_category(),
+                Duration::from_secs(MAX_SAME_KEY_429_WAIT_SECS),
+            )
             .await
             .map_err(|e| match e {
                 crate::auth::SlotAcquireResult::InvalidKey => {
@@ -373,19 +544,49 @@ impl ProxyCore {
                     message: Some("Proxy key rate limit exceeded.".into()),
                     retry_after: Some(format!("{}", wait_needed.as_secs().max(1))),
                 },
+                crate::auth::SlotAcquireResult::Jailed {
+                    escalation_level,
+                    unlock_in_secs,
+                } => ProxyError::Jailed {
+                    escalation_level,
+                    unlock_in_secs,
+                },
                 crate::auth::SlotAcquireResult::Ok => unreachable!(),
             })?;
 
-        let start_in = Instant::now();
-        match self.check_input(body, chain).await {
-            Ok(in_calls) => {
-                timing.filter_input_ms = start_in.elapsed().as_millis() as u64;
-                timing.filter_calls += in_calls;
-            }
-            Err(e) => {
-                timing.filter_input_ms = start_in.elapsed().as_millis() as u64;
-                timing.filter_calls += 1;
-                return Err(e);
+        if let Some(b) = body.as_ref() {
+            let start_in = Instant::now();
+            match self.check_input(b, chain).await {
+                Ok(in_calls) => {
+                    timing.filter_input_ms = start_in.elapsed().as_millis() as u64;
+                    timing.filter_calls += in_calls;
+                }
+                Err(mut e) => {
+                    timing.filter_input_ms = start_in.elapsed().as_millis() as u64;
+                    timing.filter_calls += 1;
+                    // ISSUE-0001：入参拦截的归因。错误信封不带 key 名（只对运维
+                    // 可见），这里把它挂到错误上并单行落日志：多客户端共用一个
+                    // 入口时，运维看这一行就知道是哪个调用方的 query 被拦。
+                    if let ProxyError::InputBlocked { proxy_key_name, .. } = &mut e {
+                        *proxy_key_name = key_name.clone();
+                    }
+                    if let ProxyError::InputBlocked {
+                        proxy_key_name,
+                        filter,
+                        confidence,
+                        ..
+                    } = &e
+                    {
+                        warn!(
+                            stage = "input",
+                            proxy_key_name = proxy_key_name.as_deref().unwrap_or("-"),
+                            filter = %filter,
+                            confidence,
+                            "input blocked by content filter; attribution recorded"
+                        );
+                    }
+                    return Err(e);
+                }
             }
         }
 
@@ -415,29 +616,53 @@ impl ProxyCore {
 
             timing.upstream_key = Some(redact_secrets(&tavily_key));
 
-            if let Some(obj) = body.as_object_mut() {
+            let mut ctx = EgressContext::new(tavily_key.clone());
+
+            if let Some(b) = body.as_deref_mut()
+                && let Some(obj) = b.as_object_mut()
+            {
                 obj.remove("api_key");
                 obj.insert("api_key".into(), Value::String(tavily_key.clone()));
             }
 
             let start_tavily = Instant::now();
+            let body_val = body.as_deref();
             let response = self
-                .send_to_tavily(&upstream_url, body)
+                .send_to_tavily(method.clone(), &upstream_url, body_val, &mut ctx)
                 .await
                 .map_err(|e| {
                     timing.tavily_ms += start_tavily.elapsed().as_millis() as u64;
-                    let outcome = EgressOutcome {
-                        status_code: None,
-                        latency: start_tavily.elapsed(),
-                        is_delivery_error: true,
-                        retry_after: None,
-                    };
-                    self.egress.record_outcome(&outcome);
-                    let detail = redact_secrets(&format!("{e:?}"));
-                    error!(error = %detail, "failed to reach tavily");
-                    ProxyError::NetworkError(detail)
+                    match e {
+                        EgressError::Backpressure { retry_after_secs } => {
+                            warn!(
+                                retry_after_secs,
+                                "gateway capacity reached; triggering backpressure fast-fail"
+                            );
+                            ProxyError::RateLimited {
+                                message: Some(
+                                    "Gateway capacity reached. Please back off and retry.".into(),
+                                ),
+                                retry_after: Some(retry_after_secs.to_string()),
+                            }
+                        }
+                        EgressError::Transport(err) => {
+                            let outcome = EgressOutcome {
+                                status_code: None,
+                                latency: start_tavily.elapsed(),
+                                is_delivery_error: true,
+                                retry_after: None,
+                            };
+                            self.egress.record_outcome(&outcome);
+                            let detail = redact_secrets(&format!("{err:?}"));
+                            error!(error = %detail, "failed to reach tavily");
+                            ProxyError::NetworkError(detail)
+                        }
+                    }
                 })?;
             timing.tavily_ms += start_tavily.elapsed().as_millis() as u64;
+
+            let actual_key = ctx.effective_api_key().to_string();
+            timing.upstream_key = Some(redact_secrets(&actual_key));
 
             let status = response.status();
             let status_code = status.as_u16();
@@ -459,7 +684,7 @@ impl ProxyCore {
                     error_body = %redact_secrets(&error_body),
                     "tavily rejected the pooled key (401); removing it from rotation"
                 );
-                self.key_pool.mark_revoked_current();
+                self.key_pool.mark_revoked_key(&actual_key);
                 continue;
             }
 
@@ -490,23 +715,26 @@ impl ProxyCore {
                     tokio::time::sleep(Duration::from_secs(wait_secs)).await;
 
                     let start_retry = Instant::now();
-                    let retry_resp =
-                        self.send_to_tavily(&upstream_url, body)
-                            .await
-                            .map_err(|e| {
-                                timing.tavily_ms += start_retry.elapsed().as_millis() as u64;
-                                let detail = redact_secrets(&format!("{e:?}"));
-                                error!(error = %detail, "failed to reach tavily on 429 retry");
-                                ProxyError::NetworkError(detail)
-                            })?;
+                    let body_val = body.as_deref();
+                    let retry_resp = self
+                        .send_to_tavily(method.clone(), &upstream_url, body_val, &mut ctx)
+                        .await
+                        .map_err(|e| {
+                            timing.tavily_ms += start_retry.elapsed().as_millis() as u64;
+                            let detail = redact_secrets(&format!("{e:?}"));
+                            error!(error = %detail, "failed to reach tavily on 429 retry");
+                            ProxyError::NetworkError(detail)
+                        })?;
                     timing.tavily_ms += start_retry.elapsed().as_millis() as u64;
 
                     let retry_status = retry_resp.status();
                     let retry_code = retry_status.as_u16();
 
                     if retry_status.is_success() {
-                        self.key_pool.record_usage();
-                        guard.commit();
+                        self.key_pool.record_usage_for_key(&actual_key);
+                        if endpoint != UpstreamEndpoint::GetResearch {
+                            guard.commit();
+                        }
                         let mut result: Value = retry_resp.json().await.map_err(|e| {
                             let message = redact_secrets(&e.to_string());
                             error!(error = %message, "failed to parse tavily response");
@@ -544,11 +772,11 @@ impl ProxyCore {
                         });
                     }
                     if retry_code == 401 {
-                        self.key_pool.mark_revoked_current();
+                        self.key_pool.mark_revoked_key(&actual_key);
                         continue;
                     }
                     if matches!(retry_code, 432 | 433) {
-                        self.key_pool.mark_exhausted_current();
+                        self.key_pool.mark_exhausted_key(&actual_key);
                         continue;
                     }
                     if (400..=499).contains(&retry_code) {
@@ -575,7 +803,7 @@ impl ProxyCore {
                     error_body = %redact_secrets(&error_body),
                     "tavily key quota exhausted (432/433)"
                 );
-                self.key_pool.mark_exhausted_current();
+                self.key_pool.mark_exhausted_key(&actual_key);
                 continue;
             }
 
@@ -595,8 +823,10 @@ impl ProxyCore {
                 });
             }
 
-            self.key_pool.record_usage();
-            guard.commit();
+            self.key_pool.record_usage_for_key(&actual_key);
+            if endpoint != UpstreamEndpoint::GetResearch {
+                guard.commit();
+            }
 
             let mut result: Value = response.json().await.map_err(|e| {
                 let message = redact_secrets(&e.to_string());
@@ -682,22 +912,12 @@ impl ProxyCore {
         let metrics_file =
             std::env::var("METRICS_FILE").unwrap_or_else(|_| "target/metrics.jsonl".into());
         if !metrics_file.is_empty() {
-            use std::io::Write;
-            if let Some(parent) = std::path::Path::new(&metrics_file).parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&metrics_file)
-            {
-                let record = metrics_record(timing, status, endpoint, error_msg);
-                let _ = writeln!(file, "{record}");
-            }
+            let record = metrics_record(timing, status, endpoint, error_msg);
+            append_metrics_line(&metrics_file, &record.to_string());
         }
     }
 
-    /// POST to Tavily, giving a connection-level failure another chance.
+    /// Send request to Tavily, giving a connection-level failure another chance.
     ///
     /// Only failures that happened *before* a response can exist are retried
     /// ([`never_reached_tavily`]): a request that Tavily may already have
@@ -707,15 +927,26 @@ impl ProxyCore {
     /// what deals with those.
     async fn send_to_tavily(
         &self,
+        method: reqwest::Method,
         url: &str,
-        body: &Value,
-    ) -> Result<reqwest::Response, reqwest::Error> {
+        body: Option<&Value>,
+        ctx: &mut EgressContext,
+    ) -> Result<reqwest::Response, EgressError> {
         let mut attempt = 1;
 
         loop {
-            match self.egress.send_upstream(url, body).await {
+            match self
+                .egress
+                .send_upstream_request(method.clone(), url, body, ctx)
+                .await
+            {
                 Ok(response) => return Ok(response),
-                Err(error) if attempt < CONNECT_ATTEMPTS && never_reached_tavily(&error) => {
+                Err(EgressError::Backpressure { retry_after_secs }) => {
+                    return Err(EgressError::Backpressure { retry_after_secs });
+                }
+                Err(EgressError::Transport(error))
+                    if attempt < CONNECT_ATTEMPTS && never_reached_tavily(&error) =>
+                {
                     warn!(
                         attempt,
                         error = %redact_secrets(&format!("{error:?}")),
@@ -742,9 +973,18 @@ impl ProxyCore {
             return Ok(0);
         }
         let mut calls = 0u32;
-        if let Some(query) = body.get("query").and_then(Value::as_str) {
+        if let Some(query) = body
+            .get("query")
+            .or_else(|| body.get("input"))
+            .and_then(Value::as_str)
+        {
             calls += self
                 .scan_units(&[ScanUnit::Query(query)], Stage::Input, chain)
+                .await?;
+        }
+        if let Some(url) = body.get("url").and_then(Value::as_str) {
+            calls += self
+                .scan_units(&[ScanUnit::Url(url)], Stage::Input, chain)
                 .await?;
         }
         if let Some(urls) = body.get("urls").and_then(Value::as_array) {
@@ -771,9 +1011,9 @@ impl ProxyCore {
         stage: Stage,
         chain: &FilterChain,
     ) -> Result<u32, ProxyError> {
-        let (results, calls) = chain.run_many_counted(units).await;
+        let (results, calls) = chain.run_many_counted(units, stage).await;
         for (unit, result) in units.iter().zip(results) {
-            surface_chain_result(result, *unit, stage)?;
+            surface_chain_result(result, *unit, stage, chain.stage_threshold(stage))?;
         }
         Ok(calls)
     }
@@ -810,13 +1050,18 @@ impl ProxyCore {
             .map(str::to_owned)
         {
             let answer_unit = [ScanUnit::Answer(&answer)];
-            let (results, answer_calls) = chain.run_many_counted(&answer_unit).await;
+            let (results, answer_calls) = chain.run_many_counted(&answer_unit, Stage::Output).await;
             calls += answer_calls;
             let result = results
                 .into_iter()
                 .next()
                 .expect("one unit in, one verdict out");
-            match surface_chain_result(result, ScanUnit::Answer(&answer), Stage::Output) {
+            match surface_chain_result(
+                result,
+                ScanUnit::Answer(&answer),
+                Stage::Output,
+                chain.stage_threshold(Stage::Output),
+            ) {
                 Ok(()) => {}
                 Err(blocked @ ProxyError::OutputBlocked { .. }) => {
                     if chain.output_block() == OutputBlockMode::WholeResponse {
@@ -824,6 +1069,38 @@ impl ProxyCore {
                     }
                     // Tavily's own "no answer available" shape.
                     body["answer"] = Value::Null;
+                    removed += 1;
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        // `content` is the research report prose produced by Tavily's research agent.
+        if let Some(content) = body
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
+            let content_unit = [ScanUnit::Answer(&content)];
+            let (results, content_calls) =
+                chain.run_many_counted(&content_unit, Stage::Output).await;
+            calls += content_calls;
+            let result = results
+                .into_iter()
+                .next()
+                .expect("one unit in, one verdict out");
+            match surface_chain_result(
+                result,
+                ScanUnit::Answer(&content),
+                Stage::Output,
+                chain.stage_threshold(Stage::Output),
+            ) {
+                Ok(()) => {}
+                Err(blocked @ ProxyError::OutputBlocked { .. }) => {
+                    if chain.output_block() == OutputBlockMode::WholeResponse {
+                        return Err(blocked);
+                    }
+                    body["content"] = Value::Null;
                     removed += 1;
                 }
                 Err(other) => return Err(other),
@@ -852,11 +1129,16 @@ impl ProxyCore {
                     .map(|(index, text)| ScanUnit::ResultItem { index, text })
                     .collect();
 
-                let (results, batch_calls) = chain.run_many_counted(&units).await;
+                let (results, batch_calls) = chain.run_many_counted(&units, Stage::Output).await;
                 calls += batch_calls;
 
                 for ((unit, slot), result) in units.iter().zip(slots.iter_mut()).zip(results) {
-                    match surface_chain_result(result, *unit, Stage::Output) {
+                    match surface_chain_result(
+                        result,
+                        *unit,
+                        Stage::Output,
+                        chain.stage_threshold(Stage::Output),
+                    ) {
                         Ok(()) => {}
                         Err(ProxyError::OutputBlocked {
                             filter,
@@ -918,17 +1200,21 @@ impl ProxyCore {
             // Tavily defines `failed_results` for entries it could not process, so
             // a blocked URL goes there with the checker's own sentence as the
             // reason: no field of ours is added.
-            UpstreamEndpoint::Extract => match body.get_mut("failed_results") {
-                Some(Value::Array(existing)) => existing.extend(failed),
-                Some(_) => {
-                    warn!("extract response had a non-array failed_results; leaving it untouched")
+            UpstreamEndpoint::Extract | UpstreamEndpoint::Crawl => {
+                match body.get_mut("failed_results") {
+                    Some(Value::Array(existing)) => existing.extend(failed),
+                    Some(_) => {
+                        warn!(
+                            "extract/crawl response had a non-array failed_results; leaving it untouched"
+                        )
+                    }
+                    None => body["failed_results"] = Value::Array(failed),
                 }
-                None => body["failed_results"] = Value::Array(failed),
-            },
+            }
             // `/search` has no such field, so this is the one place the service
             // may add a key Tavily never sends — and only when the operator asked
             // for it.
-            UpstreamEndpoint::Search => {
+            _ => {
                 if chain.report_filtered() != ReportFiltered::Field {
                     return;
                 }
@@ -939,6 +1225,38 @@ impl ProxyCore {
             }
         }
     }
+}
+
+/// Process-wide serialization for `metrics.jsonl` appends: concurrent
+/// `record_metrics_event` calls used to interleave their `writeln!` chunks and
+/// corrupt lines (ISSUE-0015; EXP-06 measured 51/905 bad). One whole line per
+/// write under the lock. Sharing one file across processes is out of scope —
+/// one `METRICS_FILE` per instance.
+static METRICS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Append one line to `path` (creating parent dirs as needed), serialized
+/// against every other metrics writer in this process.
+pub fn append_metrics_line(path: &str, line: &str) {
+    use std::io::Write;
+    let _guard = METRICS_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    if !buf.ends_with('\n') {
+        buf.push('\n');
+    }
+    let _ = file.write_all(buf.as_bytes());
 }
 
 /// One line of `metrics.jsonl`: the per-request metric record.
@@ -1075,8 +1393,9 @@ fn surface_chain_result(
     result: ChainResult,
     unit: ScanUnit<'_>,
     stage: Stage,
+    threshold: f64,
 ) -> Result<(), ProxyError> {
-    log_chain_result(&result, unit, stage);
+    log_chain_result(&result, unit, stage, threshold);
 
     match result.verdict {
         ChainVerdict::Pass | ChainVerdict::Flagged { .. } => Ok(()),
@@ -1089,6 +1408,7 @@ fn surface_chain_result(
                 filter,
                 message,
                 confidence,
+                proxy_key_name: None,
             },
             Stage::Output => ProxyError::OutputBlocked {
                 filter,
@@ -1104,7 +1424,7 @@ fn surface_chain_result(
     }
 }
 
-fn log_chain_result(result: &ChainResult, unit: ScanUnit<'_>, stage: Stage) {
+fn log_chain_result(result: &ChainResult, unit: ScanUnit<'_>, stage: Stage, threshold: f64) {
     let kind = unit.kind();
     let index = unit.index().unwrap_or(0);
 
@@ -1132,6 +1452,7 @@ fn log_chain_result(result: &ChainResult, unit: ScanUnit<'_>, stage: Stage) {
             filter = %filter,
             message = %redact_secrets(message),
             confidence,
+            threshold,
             "content flagged below the block threshold; passing it through"
         ),
         ChainVerdict::Blocked {
@@ -1145,6 +1466,7 @@ fn log_chain_result(result: &ChainResult, unit: ScanUnit<'_>, stage: Stage) {
             filter = %filter,
             message = %redact_secrets(message),
             confidence,
+            threshold,
             "content blocked"
         ),
         ChainVerdict::Unavailable { filter, detail } => warn!(
@@ -1155,5 +1477,42 @@ fn log_chain_result(result: &ChainResult, unit: ScanUnit<'_>, stage: Stage) {
             detail = %detail,
             "content filter unavailable; failing closed"
         ),
+    }
+}
+
+#[cfg(test)]
+mod metrics_write_tests {
+    use super::append_metrics_line;
+
+    #[test]
+    fn concurrent_writes_never_interleave() {
+        let dir = std::env::temp_dir().join(format!("tvly-metrics-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.jsonl");
+        let path_str = path.to_string_lossy().into_owned();
+
+        let mut handles = Vec::new();
+        for t in 0..8u32 {
+            let p = path_str.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..500u32 {
+                    let line =
+                        format!(r#"{{"t":{t},"i":{i},"pad":"0123456789abcdef0123456789abcdef"}}"#);
+                    append_metrics_line(&p, &line);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 4000, "every written line must survive");
+        for line in &lines {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("corrupt metrics line {line:?}: {e}"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

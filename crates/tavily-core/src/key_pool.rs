@@ -1,8 +1,9 @@
 use parking_lot::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tracing::{info, warn};
 
 use crate::config::{Config, TavilyKeyConfig};
+use crate::quota_cycle::next_monthly_reset;
 use crate::rate_limiter::{DEFAULT_DEV_RPM, TokenBucket, default_rpm_for_key};
 
 struct KeyState {
@@ -10,6 +11,10 @@ struct KeyState {
     max_requests: Option<u64>,
     used_requests: u64,
     status: KeyStatus,
+    /// When an upstream 432/433 (`Exhausted`) key may be tried again: the next
+    /// monthly quota reset (ISSUE-0014). `None` = never — either the local
+    /// `max_requests` fuse (instance lifetime) or `Revoked` (401).
+    exhausted_until: Option<SystemTime>,
 }
 
 /// A key is either serving or gone for this cycle. Deliberately no "rate
@@ -75,6 +80,7 @@ impl KeyPool {
                 max_requests: c.max_requests,
                 used_requests: 0,
                 status: KeyStatus::Available,
+                exhausted_until: None,
             })
             .collect();
 
@@ -108,6 +114,7 @@ impl KeyPool {
         if len == 0 {
             return None;
         }
+        reactivate_due_keys(&mut keys);
 
         for _ in 0..len {
             let state = &mut keys[*idx];
@@ -120,6 +127,7 @@ impl KeyPool {
 
                     if over_limit {
                         state.status = KeyStatus::Exhausted;
+                        state.exhausted_until = None;
                         let masked = mask_key(&state.key);
                         warn!(
                             key = %masked,
@@ -178,7 +186,28 @@ impl KeyPool {
         }
     }
 
-    /// Mark the current key as permanently exhausted for this cycle (432/433).
+    pub fn record_usage_for_key(&self, key: &str) {
+        let mut keys = self.keys.lock();
+        if let Some(state) = keys.iter_mut().find(|k| k.key == key) {
+            state.used_requests += 1;
+            let masked = mask_key(&state.key);
+            info!(key = %masked, used = state.used_requests, "recorded usage for key");
+        } else {
+            let idx = *self.current_index.lock();
+            if let Some(state) = keys.get_mut(idx) {
+                state.used_requests += 1;
+                let masked = mask_key(&state.key);
+                info!(key = %masked, used = state.used_requests, "recorded usage (fallback index)");
+            }
+        }
+    }
+
+    /// Mark the current key exhausted for the rest of the billing month
+    /// (432/433): it rejoins rotation at the monthly quota reset (ISSUE-0014).
+    ///
+    /// **Test-sim only.** Production 432/433 paths use the identity variant
+    /// [`Self::mark_exhausted_key`] — under concurrency the index has usually
+    /// already rotated past the key that actually failed (ISSUE-0017).
     pub fn mark_exhausted_current(&self) {
         let mut keys = self.keys.lock();
         let mut idx = self.current_index.lock();
@@ -187,9 +216,15 @@ impl KeyPool {
             return;
         }
         if let Some(state) = keys.get_mut(*idx) {
+            let until = next_monthly_reset(SystemTime::now());
             state.status = KeyStatus::Exhausted;
+            state.exhausted_until = Some(until);
             let masked = mask_key(&state.key);
-            warn!(key = %masked, "key marked as exhausted (monthly quota depleted)");
+            warn!(
+                key = %masked,
+                reset_utc = ?until,
+                "key marked as exhausted (monthly quota depleted); reactivates at monthly reset"
+            );
         }
         *idx = (*idx + 1) % len;
         let masked = mask_key(&keys[*idx].key);
@@ -197,6 +232,9 @@ impl KeyPool {
     }
 
     /// Mark the current key as revoked upstream (401) and rotate away from it.
+    ///
+    /// **Test-sim only** — production uses [`Self::mark_revoked_key`]
+    /// (ISSUE-0017).
     pub fn mark_revoked_current(&self) {
         let mut keys = self.keys.lock();
         let mut idx = self.current_index.lock();
@@ -206,6 +244,7 @@ impl KeyPool {
         }
         if let Some(state) = keys.get_mut(*idx) {
             state.status = KeyStatus::Revoked;
+            state.exhausted_until = None;
             let masked = mask_key(&state.key);
             warn!(key = %masked, "key revoked upstream (401), removed from rotation");
         }
@@ -218,8 +257,65 @@ impl KeyPool {
         let mut keys = self.keys.lock();
         if let Some(state) = keys.get_mut(index) {
             state.status = KeyStatus::Exhausted;
+            state.exhausted_until = Some(next_monthly_reset(SystemTime::now()));
             let masked = mask_key(&state.key);
             warn!(key = %masked, "key marked as exhausted");
+        }
+    }
+
+    /// Mark a **specific** key exhausted (432/433) until the monthly reset
+    /// (ISSUE-0014). Identity-based: a concurrent cohort of 432s must never
+    /// mark whatever index the rotation happens to point at (ISSUE-0017).
+    pub fn mark_exhausted_key(&self, key: &str) {
+        let mut keys = self.keys.lock();
+        let Some(idx) = keys.iter().position(|k| k.key == key) else {
+            warn!(key = %mask_key(key), "432 for a key not in the pool; ignoring");
+            return;
+        };
+        {
+            let state = &mut keys[idx];
+            if state.status != KeyStatus::Exhausted {
+                let until = next_monthly_reset(SystemTime::now());
+                state.status = KeyStatus::Exhausted;
+                state.exhausted_until = Some(until);
+                let masked = mask_key(&state.key);
+                warn!(
+                    key = %masked,
+                    reset_utc = ?until,
+                    "key marked as exhausted (monthly quota depleted); reactivates at monthly reset"
+                );
+            }
+        }
+        let mut cur = self.current_index.lock();
+        if *cur == idx {
+            *cur = (idx + 1) % keys.len();
+            let masked = mask_key(&keys[*cur].key);
+            info!(next_key = %masked, "rotated to next key after exhaustion");
+        }
+    }
+
+    /// Mark a **specific** key revoked (401) — permanent, never reactivates.
+    /// Identity-based for the same reason as [`Self::mark_exhausted_key`].
+    pub fn mark_revoked_key(&self, key: &str) {
+        let mut keys = self.keys.lock();
+        let Some(idx) = keys.iter().position(|k| k.key == key) else {
+            warn!(key = %mask_key(key), "401 for a key not in the pool; ignoring");
+            return;
+        };
+        {
+            let state = &mut keys[idx];
+            if state.status != KeyStatus::Revoked {
+                state.status = KeyStatus::Revoked;
+                state.exhausted_until = None;
+                let masked = mask_key(&state.key);
+                warn!(key = %masked, "key revoked upstream (401), removed from rotation");
+            }
+        }
+        let mut cur = self.current_index.lock();
+        if *cur == idx {
+            *cur = (idx + 1) % keys.len();
+            let masked = mask_key(&keys[*cur].key);
+            info!(next_key = %masked, "rotated to next key after revocation");
         }
     }
 
@@ -243,15 +339,16 @@ impl KeyPool {
     }
 
     pub fn available_keys(&self) -> usize {
-        self.keys
-            .lock()
-            .iter()
+        let mut keys = self.keys.lock();
+        reactivate_due_keys(&mut keys);
+        keys.iter()
             .filter(|k| matches!(k.status, KeyStatus::Available))
             .count()
     }
 
     pub fn all_terminally_dead(&self) -> bool {
-        let keys = self.keys.lock();
+        let mut keys = self.keys.lock();
+        reactivate_due_keys(&mut keys);
         keys.is_empty()
             || keys
                 .iter()
@@ -264,4 +361,147 @@ pub fn mask_key(key: &str) -> String {
         return "***".to_string();
     }
     format!("{}...{}", &key[..7], &key[key.len() - 4..])
+}
+
+/// Sweep: an `Exhausted` (432/433) key whose monthly reset deadline has
+/// passed rejoins the pool (ISSUE-0014). `Revoked` (401) and the local
+/// `max_requests` fuse carry no deadline and never revive.
+fn reactivate_due_keys(keys: &mut [KeyState]) {
+    let now = SystemTime::now();
+    for state in keys.iter_mut() {
+        if state.status == KeyStatus::Exhausted
+            && let Some(until) = state.exhausted_until
+            && now >= until
+        {
+            state.status = KeyStatus::Available;
+            state.exhausted_until = None;
+            info!(
+                key = %mask_key(&state.key),
+                "monthly reset reached; exhausted key reactivated"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn single_key_pool() -> KeyPool {
+        KeyPool::with_rpm(&[TavilyKeyConfig::new("tvly-virtual-unit-test")], 0)
+    }
+
+    #[test]
+    fn exhausted_key_frozen_until_a_future_monthly_reset() {
+        let pool = single_key_pool();
+        pool.mark_exhausted_current();
+        assert_eq!(
+            pool.get_key(),
+            None,
+            "432 key must stay out before the reset"
+        );
+        let until = pool.keys.lock()[0].exhausted_until;
+        let until = until.expect("432 sets a reset deadline");
+        assert!(until > SystemTime::now(), "deadline must be in the future");
+        assert!(pool.all_terminally_dead(), "still dead while frozen");
+    }
+
+    #[test]
+    fn exhausted_key_reactivates_once_reset_passed() {
+        let pool = single_key_pool();
+        pool.mark_exhausted_current();
+        // Simulate the monthly reset having arrived.
+        pool.keys.lock()[0].exhausted_until = Some(SystemTime::now() - Duration::from_secs(1));
+        assert_eq!(pool.get_key().as_deref(), Some("tvly-virtual-unit-test"));
+        assert!(
+            pool.keys.lock()[0].exhausted_until.is_none(),
+            "deadline cleared"
+        );
+        assert_eq!(pool.available_keys(), 1);
+    }
+
+    #[test]
+    fn all_dead_fast_path_wakes_up_after_reset() {
+        let pool = single_key_pool();
+        pool.mark_exhausted_current();
+        assert!(pool.all_terminally_dead(), "503 fast-path while frozen");
+        pool.keys.lock()[0].exhausted_until = Some(SystemTime::now() - Duration::from_secs(1));
+        assert!(
+            !pool.all_terminally_dead(),
+            "fast-path must not stick after reset"
+        );
+    }
+
+    #[test]
+    fn revoked_key_never_reactivates() {
+        let pool = single_key_pool();
+        pool.mark_revoked_current();
+        assert_eq!(pool.get_key(), None);
+        assert!(pool.keys.lock()[0].exhausted_until.is_none());
+    }
+
+    #[test]
+    fn local_fuse_is_permanent_for_the_instance() {
+        let pool = KeyPool::with_rpm(
+            &[TavilyKeyConfig::new("tvly-virtual-unit-test").with_limit(0)],
+            0,
+        );
+        assert_eq!(pool.get_key(), None);
+        assert!(
+            pool.keys.lock()[0].exhausted_until.is_none(),
+            "no calendar revival for the local max_requests fuse"
+        );
+    }
+
+    fn two_key_pool() -> KeyPool {
+        KeyPool::with_rpm(
+            &[
+                TavilyKeyConfig::new("tvly-virtual-bench-1"),
+                TavilyKeyConfig::new("tvly-virtual-bench-2"),
+            ],
+            0,
+        )
+    }
+
+    #[test]
+    fn duplicate_cohort_432_marks_only_the_failing_key() {
+        let pool = two_key_pool();
+        // Two 432s for the same key, as a concurrent cohort of requests would
+        // deliver: the index has already rotated after the first, so a
+        // downstream caller re-marking by index would hit the innocent key.
+        pool.mark_exhausted_key("tvly-virtual-bench-1");
+        pool.mark_exhausted_key("tvly-virtual-bench-1");
+        assert_eq!(
+            pool.available_keys(),
+            1,
+            "the innocent key must survive a duplicate cohort 432"
+        );
+        assert_eq!(pool.get_key().as_deref(), Some("tvly-virtual-bench-2"));
+        assert!(!pool.all_terminally_dead());
+    }
+
+    #[test]
+    fn mark_exhausted_key_unknown_is_noop() {
+        let pool = single_key_pool();
+        pool.mark_exhausted_key("tvly-virtual-nope");
+        assert_eq!(
+            pool.available_keys(),
+            1,
+            "an unknown key must not exhaust anything"
+        );
+        assert_eq!(pool.get_key().as_deref(), Some("tvly-virtual-unit-test"));
+    }
+
+    #[test]
+    fn cohort_revoked_marks_only_the_failing_key() {
+        let pool = two_key_pool();
+        pool.mark_revoked_key("tvly-virtual-bench-1");
+        pool.mark_revoked_key("tvly-virtual-bench-1");
+        assert_eq!(
+            pool.available_keys(),
+            1,
+            "the innocent key must survive a repeated 401 for its peer"
+        );
+        assert_eq!(pool.get_key().as_deref(), Some("tvly-virtual-bench-2"));
+    }
 }

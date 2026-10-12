@@ -1,0 +1,13 @@
+# 依赖与打包产物
+node_modules/
+dist/
+.astro/
+*.log
+
+# 关键：绝不跟踪外部笔记源软链接及其实际内容
+
+# 系统环境文件与敏感配置
+.env
+.env.*
+.DS_Store
+Thumbs.db

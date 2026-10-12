@@ -24,8 +24,7 @@ rpm = 90
 # 每个 key 可选配：
 # - max_requests: 单实例生命周期累计请求上限（熔断保险丝，0 或不配表示无限制）。
 #   真实月度配额耗尽由上游 432/433 响应自动驱动封锁，此处仅作本地异常失控防护
-# - group / rpm: 已弃用（分组不增加容量，桶只有一个）。本版本仍解析并告警，
-#   下一版拒绝启动；上游速率请写在 [upstream] rpm
+# - rpm: 已弃用（该值只作单桶预算下界）；上游速率请写在 [upstream] rpm
 [[tavily_keys]]
 key = "tvly-dev-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 max_requests = 1000      # 可选：单实例生命周期累计请求上限（熔断保险丝）
@@ -78,8 +77,10 @@ filter = []                       # 例：可信内部工具，显式免审（�
 # 检查跑在一条链上，按 [[filter.rules]] 的顺序执行；两个阶段由 stages 选开哪些（默认只查出参）：
 #   入参阶段：search 的 query、extract 的 urls —— 调用方自己的输入，交给持有 proxy key 的调用方负责
 #   出参阶段：search 返回的 answer、results 里的每一条 —— 不可信上游的输出，代理的本职
-# 判定规则：任一检查器给的分数 >= block_threshold 即拦截（并短路，不再跑后面的），
-#          低于阈值则放行（只写日志）。检查器报错/超时按 on_error 处理。
+# 判定规则：任一检查器给的分数 >= 该阶段阈值即拦截（并短路，不再跑后面的），
+#          低于阈值则放行（只写日志）。阈值按阶段取值（ISSUE-0004）：
+#          入参/出参信任级别不同，默认入参更难拦（0.95）、出参0.8。
+#          检查器报错/超时按 on_error 处理。
 # 顺序要紧：链按单元顺序跑，便宜的放前面能靠短路省掉后面贵的调用；
 #          出参的 N 条结果则是合批成一次调用送审（见下方 llm 说明）。
 #
@@ -102,7 +103,12 @@ filter = []                       # 例：可信内部工具，显式免审（�
 # [filter]
 # stages = ["output"]           # 默认：只查出参。["input","output"] 打开入参拦截（合规场景），
 #                               # 换来的是入参那次检查的耗时与 token 花销（收益远低于出参）
-# block_threshold = 0.8          # 达到或超过即拦截；低于则放行（只记日志）
+# block_threshold = 0.8          # 出参默认阈值；达到或超过即拦截，低于则放行（只记日志）
+# input_block_threshold = 0.95   # 入参阈值（默认0.95，独立于 block_threshold）：入参是调用方
+#                                # 自己的文本，误拦直接伤害调用方，需更高确信度才拦；显式设置可覆盖
+# output_block_threshold = 0.8   # 出参阈值显式覆盖（缺省 = block_threshold）
+# 线上依据（2026-10 生产日志）：入参拦截9例全部 confidence≥0.99、入参 flagged 为0，
+# 0.8~0.95 区间样本全部来自出参——入参默认0.95 不改变任何既有拦截行为。
 # on_error = "fail_closed"       # fail_closed（默认：检查不可用就不交付）/ fail_open（放行并记录）
 # output_block = "drop_items"    # drop_items（默认：只摘掉命中那条）/ whole_response（整包拒）
 # scan_raw_content = false       # 是否连同 results 的 raw_content（整页正文）一起扫；按 token 计费的服务开着会贵。

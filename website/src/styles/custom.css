@@ -1,0 +1,6 @@
+/* 隐藏 Markdown 正文首部重复渲染的一级标题（Starlight 已在 PageTitle 组件中渲染了页面大标题） */
+.sl-markdown-content > .level-h1:first-child,
+.sl-markdown-content > .sl-heading-wrapper.level-h1:first-child,
+.sl-markdown-content > h1:first-child {
+  display: none !important;
+}

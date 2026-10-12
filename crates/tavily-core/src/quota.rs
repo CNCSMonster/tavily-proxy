@@ -12,15 +12,64 @@ pub const ROLLING_WINDOW_DAYS: usize = 30;
 
 pub use crate::auth::QuotaSlotGuard;
 
+/// 按操作类型分账的用量类别（ISSUE-0009）。
+///
+/// `search_usage` 只计 `/search`，`extract_usage` 只计 `/extract`，
+/// crawl / map / research 同理；`GET /research/{id}` 轮询不扣配额，
+/// 因此不会出现在任何类别里（上游 4xx 兜底提交除外，归入 research）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageCategory {
+    Search,
+    Extract,
+    Crawl,
+    Map,
+    Research,
+}
+
+impl UsageCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UsageCategory::Search => "search",
+            UsageCategory::Extract => "extract",
+            UsageCategory::Crawl => "crawl",
+            UsageCategory::Map => "map",
+            UsageCategory::Research => "research",
+        }
+    }
+}
+
+/// 全部类别，供对账/查询遍历。
+pub const USAGE_CATEGORIES: [UsageCategory; 5] = [
+    UsageCategory::Search,
+    UsageCategory::Extract,
+    UsageCategory::Crawl,
+    UsageCategory::Map,
+    UsageCategory::Research,
+];
+
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsageBucket {
     /// 每日结算已用请求数（按 UTC 日期归档）
     pub daily: BTreeMap<NaiveDate, u64>,
+    /// 每日结算数按操作类型的分类账（ISSUE-0009）：总账 = 各类之和
+    pub daily_by_category: BTreeMap<UsageCategory, BTreeMap<NaiveDate, u64>>,
     /// 当前在途未结算请求数（Reserve 阶段占用，Settle 释放）
     pub in_flight: u64,
 }
 
 impl TokenUsageBucket {
+    /// 结算一笔请求：总账 +1，同时按类别记入分类账。
+    pub fn record_settled(&mut self, today: NaiveDate, category: UsageCategory) {
+        *self.daily.entry(today).or_insert(0) += 1;
+        *self
+            .daily_by_category
+            .entry(category)
+            .or_default()
+            .entry(today)
+            .or_insert(0) += 1;
+    }
+
     /// 计算以 today 为基准、过去 30 天（含 today）的累计已结算用量
     pub fn settled_in_window(&self, today: NaiveDate) -> u64 {
         let cutoff = today - Days::new((ROLLING_WINDOW_DAYS - 1) as u64);
@@ -28,6 +77,15 @@ impl TokenUsageBucket {
             .range(cutoff..=today)
             .map(|(_, &count)| count)
             .sum()
+    }
+
+    /// 同上，但只统计某一操作类别的结算量（ISSUE-0009）
+    pub fn settled_in_window_by_category(&self, today: NaiveDate, category: UsageCategory) -> u64 {
+        let cutoff = today - Days::new((ROLLING_WINDOW_DAYS - 1) as u64);
+        self.daily_by_category
+            .get(&category)
+            .map(|daily| daily.range(cutoff..=today).map(|(_, &count)| count).sum())
+            .unwrap_or(0)
     }
 
     /// 清理早于保留期限的历史用量（若 retention_days = 0 则不清理）。
@@ -42,6 +100,9 @@ impl TokenUsageBucket {
                 cutoff
             };
             self.daily.retain(|&date, _| date >= effective_cutoff);
+            for daily in self.daily_by_category.values_mut() {
+                daily.retain(|&date, _| date >= effective_cutoff);
+            }
         }
     }
 
@@ -62,6 +123,11 @@ pub struct QuotaStateFile {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TokenQuotaData {
     pub daily: BTreeMap<NaiveDate, u64>,
+    /// 按操作类型的分类账（ISSUE-0009）。
+    /// `#[serde(default)]`：旧版 v1 账本没有该字段，装载时按“无分类”解读，
+    /// 历史总量不受影响（其类别归属已不可考，不回填，避免污染 search_usage）。
+    #[serde(default)]
+    pub categories: BTreeMap<UsageCategory, BTreeMap<NaiveDate, u64>>,
 }
 
 /// 默认配额持久化文件存储路径：~/.local/state/tavily-proxy/quota.json
@@ -106,7 +172,11 @@ pub fn prune_and_serialize(
     for (k, bucket) in buckets {
         let mut daily = bucket.daily.clone();
         daily.retain(|&date, _| date >= retention_cutoff);
-        tokens_data.insert(k.clone(), TokenQuotaData { daily });
+        let mut categories = bucket.daily_by_category.clone();
+        for daily in categories.values_mut() {
+            daily.retain(|&date, _| date >= retention_cutoff);
+        }
+        tokens_data.insert(k.clone(), TokenQuotaData { daily, categories });
     }
 
     let mut state = QuotaStateFile {
@@ -138,6 +208,9 @@ pub fn prune_and_serialize(
 
             for token_data in state.tokens.values_mut() {
                 token_data.daily.remove(&date_to_evict);
+                for daily in token_data.categories.values_mut() {
+                    daily.remove(&date_to_evict);
+                }
             }
 
             json_bytes = serde_json::to_vec_pretty(&state)?;
@@ -209,6 +282,7 @@ pub fn load_quota_or_recover(
             for (key, data) in file.tokens {
                 let mut b = TokenUsageBucket {
                     daily: data.daily,
+                    daily_by_category: data.categories,
                     in_flight: 0,
                 };
                 b.prune_retention(today, retention_days);
@@ -258,6 +332,61 @@ fn backup_corrupt_file(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ISSUE-0009：分类账本——总 = 各类之和，持久化 roundtrip 与旧版账本兼容。
+    #[test]
+    fn test_category_accounting_and_roundtrip() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
+        let mut bucket = TokenUsageBucket::default();
+        bucket.record_settled(today, UsageCategory::Search);
+        bucket.record_settled(today, UsageCategory::Extract);
+        bucket.record_settled(today, UsageCategory::Extract);
+
+        assert_eq!(bucket.settled_in_window(today), 3);
+        assert_eq!(
+            bucket.settled_in_window_by_category(today, UsageCategory::Search),
+            1
+        );
+        assert_eq!(
+            bucket.settled_in_window_by_category(today, UsageCategory::Extract),
+            2
+        );
+        assert_eq!(
+            bucket.settled_in_window_by_category(today, UsageCategory::Crawl),
+            0
+        );
+
+        // 持久化 → 装载 roundtrip（分类账随行）
+        let temp_dir = tempfile::tempdir().unwrap();
+        let quota_file = temp_dir.path().join("quota.json");
+        let mut buckets = BTreeMap::new();
+        buckets.insert("key-cat".to_string(), bucket);
+        save_quota_atomic(&quota_file, &buckets, 365, 10 * 1024 * 1024).unwrap();
+        let loaded = load_quota_or_recover(&quota_file, 365);
+        let restored = loaded.get("key-cat").unwrap();
+        assert_eq!(restored.settled_in_window(today), 3);
+        assert_eq!(
+            restored.settled_in_window_by_category(today, UsageCategory::Extract),
+            2
+        );
+
+        // 旧版 v1 账本（无 categories 字段）兼容装载：总量保留，分类为 0
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "updated_at": "2026-10-05T00:00:00Z",
+            "tokens": { "old-key": { "daily": { "2026-10-04": 7 } } }
+        });
+        std::fs::write(&quota_file, legacy.to_string()).unwrap();
+        let legacy_loaded = load_quota_or_recover(&quota_file, 365);
+        let old = legacy_loaded.get("old-key").unwrap();
+        let legacy_day = NaiveDate::from_ymd_opt(2026, 10, 4).unwrap();
+        assert_eq!(old.settled_in_window(legacy_day), 7);
+        assert_eq!(
+            old.settled_in_window_by_category(legacy_day, UsageCategory::Search),
+            0,
+            "旧账本历史不回填分类，避免污染 search_usage"
+        );
+    }
 
     #[test]
     fn test_rolling_window_calculation() {
@@ -387,6 +516,7 @@ mod tests {
         // 30 天滑动窗口计算只累加 10 天前 (30) + 今日 (5) = 35
         let b_restored = TokenUsageBucket {
             daily: tok_data.daily.clone(),
+            daily_by_category: tok_data.categories.clone(),
             in_flight: 0,
         };
         assert_eq!(b_restored.settled_in_window(today), 35);

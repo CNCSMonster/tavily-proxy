@@ -18,16 +18,96 @@ pub struct EgressOutcome {
     pub retry_after: Option<Duration>,
 }
 
+#[derive(Debug)]
+pub enum EgressError {
+    Transport(reqwest::Error),
+    Backpressure { retry_after_secs: u64 },
+}
+
+impl std::fmt::Display for EgressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EgressError::Transport(e) => write!(f, "HTTP transport error: {e}"),
+            EgressError::Backpressure { retry_after_secs } => {
+                write!(
+                    f,
+                    "Gateway backpressure: all available egress capacity exhausted (retry after {retry_after_secs}s)"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EgressError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            EgressError::Transport(e) => Some(e),
+            EgressError::Backpressure { .. } => None,
+        }
+    }
+}
+
+impl From<reqwest::Error> for EgressError {
+    fn from(e: reqwest::Error) -> Self {
+        EgressError::Transport(e)
+    }
+}
+
+/// Upstream HTTP request transport context.
+#[derive(Debug, Clone)]
+pub struct EgressContext {
+    /// The default Tavily API key suggested by core.
+    pub suggested_api_key: String,
+    /// The actual Tavily API key used by the egress implementation.
+    pub effective_api_key: Option<String>,
+}
+
+impl EgressContext {
+    pub fn new(suggested_api_key: String) -> Self {
+        Self {
+            suggested_api_key,
+            effective_api_key: None,
+        }
+    }
+
+    pub fn set_effective_api_key(&mut self, key: String) {
+        self.effective_api_key = Some(key);
+    }
+
+    pub fn effective_api_key(&self) -> &str {
+        self.effective_api_key
+            .as_deref()
+            .unwrap_or(&self.suggested_api_key)
+    }
+}
+
 #[async_trait]
 pub trait Egress: Send + Sync {
-    /// Logical name of the egress (e.g. "direct", "hk-proxy-1")
+    /// Logical name of the egress (e.g. "direct", "corporate-proxy")
     fn name(&self) -> &str;
 
     /// Whether this egress is currently available (not in 429 cooldown, has token)
     fn is_available(&self) -> bool;
 
-    /// Send HTTP request to upstream URL
-    async fn send_upstream(&self, url: &str, body: &Value) -> Result<Response, reqwest::Error>;
+    /// Send HTTP request to upstream URL (POST with JSON body by default)
+    async fn send_upstream(
+        &self,
+        url: &str,
+        body: &Value,
+        ctx: &mut EgressContext,
+    ) -> Result<Response, EgressError> {
+        self.send_upstream_request(reqwest::Method::POST, url, Some(body), ctx)
+            .await
+    }
+
+    /// Send HTTP request to upstream URL with arbitrary method and optional body
+    async fn send_upstream_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<&Value>,
+        ctx: &mut EgressContext,
+    ) -> Result<Response, EgressError>;
 
     /// Record outcome of a request (updates cooldown, metrics, etc.)
     fn record_outcome(&self, outcome: &EgressOutcome);
@@ -82,8 +162,32 @@ impl Egress for DirectEgress {
         }
     }
 
-    async fn send_upstream(&self, url: &str, body: &Value) -> Result<Response, reqwest::Error> {
-        self.client.post(url).json(body).send().await
+    async fn send_upstream(
+        &self,
+        url: &str,
+        body: &Value,
+        ctx: &mut EgressContext,
+    ) -> Result<Response, EgressError> {
+        self.send_upstream_request(reqwest::Method::POST, url, Some(body), ctx)
+            .await
+    }
+
+    async fn send_upstream_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<&Value>,
+        ctx: &mut EgressContext,
+    ) -> Result<Response, EgressError> {
+        ctx.set_effective_api_key(ctx.suggested_api_key.clone());
+        let mut req = self
+            .client
+            .request(method, url)
+            .bearer_auth(&ctx.suggested_api_key);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        req.send().await.map_err(EgressError::from)
     }
 
     fn record_outcome(&self, outcome: &EgressOutcome) {

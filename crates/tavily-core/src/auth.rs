@@ -2,21 +2,37 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, Utc};
 use parking_lot::Mutex;
 use tracing::warn;
 
 use crate::config::ProxyKeyConfig;
-use crate::quota::{TokenUsageBucket, load_quota_or_recover, save_quota_atomic};
+use crate::quota::{TokenUsageBucket, UsageCategory, load_quota_or_recover, save_quota_atomic};
 use crate::rate_limiter::TokenBucket;
+
+pub const PENALTY_CONSECUTIVE_THRESHOLD: u32 = 60;
+pub const PENALTY_LEVEL_1_DURATION: Duration = Duration::from_secs(5 * 60);
+pub const PENALTY_LEVEL_2_DURATION: Duration = Duration::from_secs(60 * 60);
+pub const PENALTY_LEVEL_3_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PenaltyBox {
+    pub consecutive_bad_requests: u32,
+    pub escalation_level: u8,
+    pub jailed_until: Option<Instant>,
+    pub permanently_locked: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyUsage {
     pub name: Option<String>,
     pub used_requests: u64,
     pub max_requests_per_month: Option<u64>,
+    /// 按操作类型分类的 30 天滚动用量（ISSUE-0009）：
+    /// `search_usage` 只含 /search，依此类推；总账 = 各类之和（历史无分类数据除外）。
+    pub categories: BTreeMap<UsageCategory, u64>,
 }
 
 struct ProxyKeyState {
@@ -26,6 +42,7 @@ struct ProxyKeyState {
     rate_limiter: Option<Arc<TokenBucket>>,
     max_concurrency: Option<usize>,
     active_concurrency: usize,
+    penalty: PenaltyBox,
 }
 
 pub struct Auth {
@@ -37,9 +54,17 @@ pub struct Auth {
 }
 
 pub enum AuthResult {
-    Ok { name: Option<String> },
+    Ok {
+        name: Option<String>,
+    },
     InvalidKey,
-    QuotaExceeded { name: Option<String> },
+    QuotaExceeded {
+        name: Option<String>,
+    },
+    Jailed {
+        escalation_level: u8,
+        unlock_in_secs: Option<u64>,
+    },
 }
 
 #[derive(Debug)]
@@ -56,6 +81,10 @@ pub enum SlotAcquireResult {
         name: Option<String>,
         wait_needed: Duration,
     },
+    Jailed {
+        escalation_level: u8,
+        unlock_in_secs: Option<u64>,
+    },
 }
 
 /// RAII Slot Guard: manages in-flight concurrency count and quota reservation.
@@ -67,6 +96,8 @@ pub struct SlotGuard {
     auth: Arc<Auth>,
     key: String,
     committed: bool,
+    /// 本请求的操作类型，结算时归入对应分类账（ISSUE-0009）。
+    category: UsageCategory,
 }
 
 impl Drop for SlotGuard {
@@ -83,7 +114,7 @@ impl SlotGuard {
     pub fn commit(&mut self) {
         if !self.committed {
             self.committed = true;
-            self.auth.commit_quota_reservation(&self.key);
+            self.auth.commit_quota_reservation(&self.key, self.category);
         }
     }
 }
@@ -136,6 +167,7 @@ impl Auth {
                     rate_limiter,
                     max_concurrency: c.max_concurrency,
                     active_concurrency: 0,
+                    penalty: PenaltyBox::default(),
                 },
             );
         }
@@ -151,10 +183,29 @@ impl Auth {
 
     pub fn authenticate(&self, key: &str) -> AuthResult {
         let today = Utc::now().date_naive();
-        let keys = self.keys.lock();
-        match keys.get(key) {
+        let mut keys = self.keys.lock();
+        match keys.get_mut(key) {
             None => AuthResult::InvalidKey,
             Some(state) => {
+                if state.penalty.permanently_locked {
+                    return AuthResult::Jailed {
+                        escalation_level: state.penalty.escalation_level,
+                        unlock_in_secs: None,
+                    };
+                }
+                if let Some(until) = state.penalty.jailed_until {
+                    let now = Instant::now();
+                    if now < until {
+                        let remaining = (until - now).as_secs().max(1);
+                        return AuthResult::Jailed {
+                            escalation_level: state.penalty.escalation_level,
+                            unlock_in_secs: Some(remaining),
+                        };
+                    } else {
+                        state.penalty.jailed_until = None;
+                    }
+                }
+
                 if let Some(max) = state.max_requests_per_month {
                     let settled = state.bucket.settled_in_window(today);
                     if settled + state.bucket.in_flight >= max {
@@ -181,6 +232,7 @@ impl Auth {
     pub async fn acquire_slot(
         self: &Arc<Self>,
         key: &str,
+        category: UsageCategory,
         max_wait: Duration,
     ) -> Result<SlotGuard, SlotAcquireResult> {
         let today = Utc::now().date_naive();
@@ -189,6 +241,25 @@ impl Auth {
             let Some(state) = keys.get_mut(key) else {
                 return Err(SlotAcquireResult::InvalidKey);
             };
+
+            if state.penalty.permanently_locked {
+                return Err(SlotAcquireResult::Jailed {
+                    escalation_level: state.penalty.escalation_level,
+                    unlock_in_secs: None,
+                });
+            }
+            if let Some(until) = state.penalty.jailed_until {
+                let now = Instant::now();
+                if now < until {
+                    let remaining = (until - now).as_secs().max(1);
+                    return Err(SlotAcquireResult::Jailed {
+                        escalation_level: state.penalty.escalation_level,
+                        unlock_in_secs: Some(remaining),
+                    });
+                } else {
+                    state.penalty.jailed_until = None;
+                }
+            }
 
             if let Some(max) = state.max_requests_per_month {
                 let settled = state.bucket.settled_in_window(today);
@@ -222,6 +293,7 @@ impl Auth {
             auth: Arc::clone(self),
             key: key.to_string(),
             committed: false,
+            category,
         };
 
         if let Some(limiter) = rate_limiter
@@ -238,12 +310,12 @@ impl Auth {
         Ok(guard)
     }
 
-    pub fn commit_quota_reservation(&self, key: &str) {
+    pub fn commit_quota_reservation(&self, key: &str, category: UsageCategory) {
         let today = Utc::now().date_naive();
         let mut keys = self.keys.lock();
         if let Some(state) = keys.get_mut(key) {
             state.bucket.in_flight = state.bucket.in_flight.saturating_sub(1);
-            *state.bucket.daily.entry(today).or_insert(0) += 1;
+            state.bucket.record_settled(today, category);
             self.dirty.store(true, Ordering::Release);
         }
     }
@@ -262,11 +334,11 @@ impl Auth {
         }
     }
 
-    pub fn record_usage(&self, key: &str) {
+    pub fn record_usage(&self, key: &str, category: UsageCategory) {
         let today = Utc::now().date_naive();
         let mut keys = self.keys.lock();
         if let Some(state) = keys.get_mut(key) {
-            *state.bucket.daily.entry(today).or_insert(0) += 1;
+            state.bucket.record_settled(today, category);
             self.dirty.store(true, Ordering::Release);
         }
     }
@@ -282,6 +354,15 @@ impl Auth {
             name: state.name.clone(),
             used_requests: state.bucket.settled_in_window(today),
             max_requests_per_month: state.max_requests_per_month,
+            categories: crate::quota::USAGE_CATEGORIES
+                .iter()
+                .map(|&category| {
+                    (
+                        category,
+                        state.bucket.settled_in_window_by_category(today, category),
+                    )
+                })
+                .collect(),
         })
     }
 
@@ -340,5 +421,152 @@ impl Auth {
                 });
             }
         }
+    }
+
+    /// Record a client-side bad request (4xx).
+    ///
+    /// Escalates through progressive penalty levels (5m -> 1h -> 24h -> permanent)
+    /// if consecutive bad requests hit `PENALTY_CONSECUTIVE_THRESHOLD`.
+    pub fn record_bad_request(&self, key: &str) {
+        let mut keys = self.keys.lock();
+        if let Some(state) = keys.get_mut(key) {
+            state.penalty.consecutive_bad_requests += 1;
+            if state.penalty.consecutive_bad_requests >= PENALTY_CONSECUTIVE_THRESHOLD {
+                state.penalty.consecutive_bad_requests = 0;
+                state.penalty.escalation_level = (state.penalty.escalation_level + 1).min(4);
+                match state.penalty.escalation_level {
+                    1 => {
+                        state.penalty.jailed_until =
+                            Some(Instant::now() + PENALTY_LEVEL_1_DURATION);
+                    }
+                    2 => {
+                        state.penalty.jailed_until =
+                            Some(Instant::now() + PENALTY_LEVEL_2_DURATION);
+                    }
+                    3 => {
+                        state.penalty.jailed_until =
+                            Some(Instant::now() + PENALTY_LEVEL_3_DURATION);
+                    }
+                    _ => {
+                        state.penalty.permanently_locked = true;
+                        state.penalty.jailed_until = None;
+                    }
+                }
+                warn!(
+                    proxy_key = %crate::key_pool::mask_key(key),
+                    level = state.penalty.escalation_level,
+                    permanently_locked = state.penalty.permanently_locked,
+                    "proxy key jailed due to excessive consecutive bad requests"
+                );
+            }
+        }
+    }
+
+    /// Record a successful request (200), resetting consecutive bad requests counter.
+    pub fn record_success(&self, key: &str) {
+        let mut keys = self.keys.lock();
+        if let Some(state) = keys.get_mut(key) {
+            state.penalty.consecutive_bad_requests = 0;
+        }
+    }
+
+    /// Reset penalty state for a given proxy key (administrator / testing unjail).
+    pub fn reset_penalty(&self, key: &str) {
+        let mut keys = self.keys.lock();
+        if let Some(state) = keys.get_mut(key) {
+            state.penalty = PenaltyBox::default();
+        }
+    }
+
+    /// Inspect penalty box state for observation and testing.
+    pub fn get_penalty_box(&self, key: &str) -> Option<PenaltyBox> {
+        let keys = self.keys.lock();
+        keys.get(key).map(|s| s.penalty.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_penalty_box_escalation_ladder() {
+        let cfg = ProxyKeyConfig {
+            key: "test-client-key".to_string(),
+            name: Some("test-client".to_string()),
+            max_requests_per_month: None,
+            rpm: None,
+            max_concurrency: None,
+            filter: None,
+        };
+        let auth = Arc::new(Auth::new(&[cfg]));
+
+        // Normal authentication should succeed
+        assert!(matches!(
+            auth.authenticate("test-client-key"),
+            AuthResult::Ok { .. }
+        ));
+
+        // Trigger Level 1 penalty: 60 bad requests
+        for _ in 0..PENALTY_CONSECUTIVE_THRESHOLD {
+            auth.record_bad_request("test-client-key");
+        }
+        match auth.authenticate("test-client-key") {
+            AuthResult::Jailed {
+                escalation_level,
+                unlock_in_secs,
+            } => {
+                assert_eq!(escalation_level, 1);
+                assert!(unlock_in_secs.is_some());
+            }
+            _ => panic!("expected Level 1 jail"),
+        }
+
+        // Fast-forward or trigger Level 2
+        for _ in 0..PENALTY_CONSECUTIVE_THRESHOLD {
+            auth.record_bad_request("test-client-key");
+        }
+        match auth.authenticate("test-client-key") {
+            AuthResult::Jailed {
+                escalation_level, ..
+            } => {
+                assert_eq!(escalation_level, 2);
+            }
+            _ => panic!("expected Level 2 jail"),
+        }
+
+        // Trigger Level 3
+        for _ in 0..PENALTY_CONSECUTIVE_THRESHOLD {
+            auth.record_bad_request("test-client-key");
+        }
+        assert!(matches!(
+            auth.authenticate("test-client-key"),
+            AuthResult::Jailed {
+                escalation_level: 3,
+                ..
+            }
+        ));
+
+        // Trigger Level 4: permanent lock
+        for _ in 0..PENALTY_CONSECUTIVE_THRESHOLD {
+            auth.record_bad_request("test-client-key");
+        }
+        match auth.authenticate("test-client-key") {
+            AuthResult::Jailed {
+                escalation_level,
+                unlock_in_secs,
+            } => {
+                assert_eq!(escalation_level, 4);
+                assert_eq!(unlock_in_secs, None); // permanent!
+            }
+            _ => panic!("expected permanent lock"),
+        }
+
+        // Reset penalty unjails the client
+        auth.reset_penalty("test-client-key");
+        assert!(matches!(
+            auth.authenticate("test-client-key"),
+            AuthResult::Ok { .. }
+        ));
     }
 }

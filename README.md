@@ -1,3 +1,4 @@
+<!-- 自动生成文件，请勿直接编辑；修改请通过文档流程提出 -->
 # Tavily Proxy
 
 Tavily API 中转服务 — 后端 key 池自动轮换，自有 API key 认证与额度管控。
@@ -13,8 +14,8 @@ Tavily API 中转服务 — 后端 key 池自动轮换，自有 API key 认证�
   - **一个令牌桶 = 一个 IP 预算**：上游的速率限制按**来源 IP**计数而不是按 key，所以多把 key 共用一只桶才是真实的预算——桶空时**本地**生成 429 + `Retry-After`，请求根本不外发，既不浪费 key 的配额也不产生无效网络开销；
   - 桶速取 `[upstream] rpm`（全池唯一来源），未配置时按首个 key 前缀取默认（`tvly-dev-` 90 RPM，生产 key 900 RPM），`rpm = 0` 表示不限速；
   - 上游 key 可选配置 `max_requests` 作为单实例生命周期累计请求上限（熔断保险丝），真实月度配额耗尽由上游 432/433 响应自动驱动封锁轮换；
-  - 旧的 `[[groups]]` 与 `[[tavily_keys]]` 的 `group` / `rpm` 字段**已弃用**（ADR-0003）：仍能解析，按旧调度顺序自动拍平进单池，启动时逐条告警，未来版本会移除。
-- **统一入口** — 对调用方看起来就是 Tavily 官方 API：成功响应是 Tavily 的原样结构，
+  - 旧的 `[[groups]]` 段与 `[[tavily_keys]]` 的 `group` 标签**已被拒绝**（ADR-0003）：配置里出现即按未知字段拒绝启动，请把 key 移入 `[[tavily_keys]]`；per-key 的 `rpm` 字段仍解析但已弃用并告警，上游速率请写在 `[upstream] rpm`。
+- **统一入口** — 对调用方看起来就是 Tavily 官方 API：支持 `/search`、`/extract`、`/crawl`、`/map`、`/research` 及 `GET /research/{request_id}` 等全部核心端点。成功响应是 Tavily 的原样结构，
   错误是 Tavily 的 `{"detail":{"error":"..."}}` 信封 + 原样状态码，没有任何本服务自造的字段
   （唯一例外默认关闭：`[filter] report_filtered = "field"`，见「内容安全检查」）
 - **自有 Key 认证与管控** — 中转服务签发独立 API key，每个 key 可独立配置：
@@ -229,6 +230,20 @@ sudo systemctl restart tavily-proxy
 | 请求级指标 | `METRICS_FILE` 指向的 JSONL（unit 默认 `/var/lib/tavily-proxy/metrics.jsonl`；置空禁用），字段含 `status` `total_ms` `filter_calls` 等 |
 | 错误日志 | `journalctl -u tavily-proxy -p err`；每请求一条 summary，可按 `key_name` 聚合各客户端用量 |
 
+## 与 tvly CLI / tavily skills 集成
+
+tavily 系 agent skills（search / extract / crawl / map / research 等）底层统一走 `tvly` CLI（官方 SDK：`Authorization: Bearer` 认证 + `POST {base}/search`，与本代理协议完全兼容）。两个环境变量即可把全部 skills 指向代理：
+
+```bash
+export TAVILY_API_KEY=<proxy-token>               # 代理签发的客户端 token（[[proxy_keys]]）
+export TAVILY_API_BASE_URL=http://127.0.0.1:3456  # 代理地址（可经 SSH 隧道转发）
+tvly search "你的查询" --json
+```
+
+- `TAVILY_API_BASE_URL` 优先级高于 tvly 配置文件里的 `api_base_url`；
+- 每个 token 可配独立 rpm 桶、月度上限与过滤路由（见 `[[proxy_keys]]`）；
+- 已端到端实测（2026-10-11）：test token 经隧道调用 `tvly search` 返回 10 条结果、1.11s。
+
 ## 内容安全检查
 
 检查默认**关闭**（`config.toml` 里不写 `[filter]` 段就是不检查）。开启后按一条链执行：
@@ -255,7 +270,10 @@ sudo systemctl restart tavily-proxy
 ```toml
 [filter]
 stages = ["output"]          # 默认只查出参；["input", "output"] 打开入参拦截
-block_threshold = 0.8        # 达到或超过即拦截；低于则放行（只写日志）
+block_threshold = 0.8        # 出参默认阈值：达到或超过即拦截；低于则放行（只写日志）
+input_block_threshold = 0.95 # 入参阈值（默认0.95，独立于 block_threshold）：入参是调用方
+                             # 自己的文本，误拦代价高，需更高确信度才拦（可覆盖）
+output_block_threshold = 0.8 # 出参阈值显式覆盖（缺省 = block_threshold）
 on_error = "fail_closed"     # 检查器超时/报错时：fail_closed 不交付 / fail_open 放行并记录
 output_block = "drop_items"  # drop_items 只摘掉命中那条 / whole_response 整包拒
 scan_raw_content = false     # 是否连 raw_content（整页正文）一起扫；按 token 计费的服务会很贵
@@ -292,8 +310,13 @@ timeout_ms = 800
 
 链的执行语义：
 
-- 分数 **≥ 阈值 → 拦截**，并立即终止该条链（后面的检查器不再跑，省掉它们的开销）
-- 分数 **< 阈值 → 放行**，只记日志；后面的检查器仍可把它升级成拦截
+阈值**按阶段取值**（ISSUE-0004）：入参默认 **0.95**、出参默认 `block_threshold`（0.8）。
+入参是调用方自己的文本，信任级别高于不可信上游回包，误拦直接伤害调用方，所以更难拦。
+线上实测（2026-10 生产日志）：入参拦截 9 例全部 confidence ≥0.99、入参 flagged 为 0，
+0.8~0.95 区间的样本全部来自出参——入参默认 0.95 不改变任何既有拦截行为。
+
+- 分数 **≥ 该阶段阈值 → 拦截**，并立即终止该条链（后面的检查器不再跑，省掉它们的开销）
+- 分数 **< 该阶段阈值 → 放行**，只记日志；后面的检查器仍可把它升级成拦截
 - 检查器超时/报错 → 按 `on_error`：`fail_closed` 时**拒绝交付未经验证的内容**（返回 503），
   `fail_open` 时记下失败并继续（那条响应就未经检查地放出去了）
 
@@ -303,7 +326,7 @@ timeout_ms = 800
 超出上限自动拆批（10 条 = 3 次调用，而不是 10 次），批与批之间按 `max_parallel_checks`
 并发。单条时
 模型回 `{"verdict":"flag"|"ok","confidence":0..1,"reason":"..."}`。`flag` 变成"可疑 + 模型给的
-分数"，**拦不拦仍由 `block_threshold` 决定**；JSON 解析不出来、批次对不上号（缺 id/数量不符）、
+分数"，**拦不拦仍由该阶段阈值决定**；JSON 解析不出来、批次对不上号（缺 id/数量不符）、
 模型回复超过 8 KiB、HTTP 非 2xx、连不上——一律算"检查失败"，走 `on_error`，**绝不静默放行**。
 **合并只影响耗时与费用，不改判定结果**：任何计划下同一单元的裁决必须一致（有测试钉死）；
 代价是批次里一条坏了按 `fail_open` 走时，那一整批都带着"未验证"的记录。
@@ -342,8 +365,9 @@ filter = ["cheap", "strict"]   # 双重审查，先便宜后严格
 - **引用错 = 启动拒绝**：规则缺 `name`、任两条重名（无论是否被引用）、
   指向 `enabled = false` 的规则、同一规则被列两次、引用未命名——
   一律启动失败，不静默降级（与"未实装 kind 拒绝启动"同一原则）；
-- **策略全局共享**：`stages` / `block_threshold` / `on_error` / `output_block` /
-  `report_*` / `max_parallel_checks` 仍是全链单值，各路由只有规则成员与顺序不同；
+- **策略全局共享**：`stages` / `on_error` / `output_block` / `report_*` /
+  `max_parallel_checks` 是全链单值，阈值按阶段分两个
+  （`input_block_threshold` / `output_block_threshold`），各路由只有规则成员与顺序不同；
 - 启动日志逐条打出 `filter route configured`（标签是 key 的 name 或配置序号
   `unnamed#N`，**绝不打印 key 原文**）；请求 summary 照旧带 `key_name` 与 `filter_calls`；
 - 免审是运维的**显式信任决策**（与 `stages` 默认值同层级）：被摘的内容对免审 token
@@ -353,8 +377,8 @@ filter = ["cheap", "strict"]   # 双重审查，先便宜后严格
 
 | 端点 | 做法 |
 |---|---|
-| `/extract` | Tavily 本来就有 `failed_results: [{url, error}]`，被拦的 URL 进这里，`error` 就是检查器的 `message`——**不新增任何字段** |
-| `/search` | 官方没有对应字段。默认 `report_filtered = "off"`，响应与 Tavily 逐字节一致；改成 `"field"` 时，**只在真有拦截**的情况下加一个顶层 `proxy_filtered: {count, message}` |
+| `/extract` / `/crawl` | Tavily 本来就有 `failed_results: [{url, error}]`，被拦的 URL 进这里，`error` 就是检查器的 `message`——**不新增任何字段** |
+| `/search` / `/map` / `/research` | 官方没有对应字段。默认 `report_filtered = "off"`，响应与 Tavily 逐字节一致；改成 `"field"` 时，**只在真有拦截**的情况下加一个顶层 `proxy_filtered: {count, message}` |
 
 **代价（如实记）**：出参的 N 条结果按批合并（默认 stages 下连 query 都不送检），
 一次 `/search` 取 10 条结果 = ceil(10/4) = 3 次调用，批并发飞行时墙上时间 ≈ 1-2 × 单次延迟；
@@ -390,7 +414,7 @@ impl ContentFilter for MyChecker {
             // unit 已经是内核切好的可扫描单元，直接判就行
             Ok(FilterVerdict::Suspicious {
                 message: "看起来是提示词注入".into(),   // 这句话会给调用方看到
-                confidence: 0.93,                      // 与 block_threshold 比较
+                confidence: 0.93,                      // 与该阶段阈值比较
             })
         })
     }
@@ -520,4 +544,41 @@ curl -X POST http://localhost:3456/search \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_PROXY_KEY" \
   -d '{"query": "latest AI news"}'
+
+# 提取网页内容
+curl -X POST http://localhost:3456/extract \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_PROXY_KEY" \
+  -d '{"urls": ["https://example.com"]}'
+
+# 爬取整站或指定页面
+curl -X POST http://localhost:3456/crawl \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_PROXY_KEY" \
+  -d '{"url": "https://example.com"}'
+
+# 网站结构探测
+curl -X POST http://localhost:3456/map \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_PROXY_KEY" \
+  -d '{"url": "https://example.com"}'
+
+# 发起 Deep Research 深度调研
+curl -X POST http://localhost:3456/research \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_PROXY_KEY" \
+  -d '{"input": "latest advances in quantum computing"}'
+
+# 查询 Research 进度与结果
+curl -X GET http://localhost:3456/research/YOUR_REQUEST_ID \
+  -H "Authorization: Bearer YOUR_PROXY_KEY"
 ```
+
+### 用量口径（ISSUE-0009）
+
+- `usage` / `plan_usage` 是 30 天滚动窗口内的**总**调用量，限额判断只看它；
+- 分类字段**按端点分账**：`search_usage` 只计 `/search`，`extract_usage` 只计 `/extract`，
+  `crawl_usage` / `map_usage` / `research_usage` 同理；**总 = 各类之和**
+  （分类账上线前的历史用量无类别归属，不回填，因此旧日期段可能出现总 > 各类之和）；
+- `GET /research/{id}` 只是查询进度，**不扣配额**，也不进任何分类；
+- key 级与 account 级同源同口径（本代理只有 token 级一个真源）。

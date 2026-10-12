@@ -11,7 +11,7 @@ path = "src/lib.rs"
 name = "core_tests"
 path = "core_tests.rs"
 
-[dependencies]
+[dev-dependencies]
 tavily-core = { path = "../crates/tavily-core" }
 tavily-server = { path = "../crates/tavily-server" }
 parking_lot = { workspace = true }
@@ -19,10 +19,7 @@ toml = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
-reqwest = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
-tracing = { workspace = true }
-fastrand = { workspace = true }

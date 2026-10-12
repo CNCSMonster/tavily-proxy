@@ -1283,7 +1283,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1292,9 +1291,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "chrono",
- "libc",
- "serde_json",
  "tavily-core",
  "tavily-server",
  "tokio",
@@ -1309,9 +1305,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
- "fastrand",
  "parking_lot",
- "reqwest",
  "serde_json",
  "tavily-core",
  "tavily-server",
@@ -1319,7 +1313,6 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
- "tracing",
 ]
 
 [[package]]
@@ -1329,11 +1322,8 @@ dependencies = [
  "anyhow",
  "axum",
  "libc",
- "serde",
  "serde_json",
  "tavily-core",
- "tokio",
- "tower",
  "tracing",
 ]
 

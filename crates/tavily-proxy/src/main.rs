@@ -289,6 +289,8 @@ fn log_filter_chain(core: &ProxyCore) {
                 .map(|(name, support)| format!("{name}({})", support.describe()))
                 .collect::<Vec<_>>(),
             block_threshold = core.filters.block_threshold(),
+            input_block_threshold = core.filters.input_block_threshold(),
+            output_block_threshold = core.filters.output_block_threshold(),
             output_block = ?core.filters.output_block(),
             scan_raw_content = core.filters.scan_raw_content(),
             "content safety chain initialized"

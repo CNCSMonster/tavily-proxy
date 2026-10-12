@@ -18,16 +18,18 @@ pub struct Config {
     pub upstream: Option<UpstreamConfig>,
     #[serde(default)]
     pub tavily_keys: Vec<TavilyKeyConfig>,
-    /// Deprecated label-only grouping (ADR-0003). Parsed for one more release,
-    /// then rejected.
-    #[serde(default)]
-    pub groups: Vec<GroupConfig>,
     pub proxy_keys: Vec<ProxyKeyConfig>,
     /// Optional storage settings (e.g. quota state file location).
     #[serde(default)]
     pub storage: Option<StorageConfig>,
     /// Content safety checks. Absent means no checks at all: filtering is opt-in.
     pub filter: Option<FilterConfig>,
+    /// Optional egress pool extensions (ISSUE-0011).
+    #[serde(default)]
+    pub egresses: Vec<toml::Value>,
+    /// Optional egress lanes extensions (ISSUE-0011).
+    #[serde(default)]
+    pub lanes: Vec<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,16 +46,6 @@ pub struct UpstreamConfig {
     /// against the egress IP, so this is one IP's budget, not one key's.
     /// `0` disables rate limiting.
     pub rpm: Option<u32>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GroupConfig {
-    pub name: String,
-    /// Deprecated: the bucket is per IP, not per group (ADR-0003).
-    pub rpm: Option<u32>,
-    #[serde(default)]
-    pub keys: Vec<TavilyKeyConfig>,
 }
 
 pub const DEFAULT_RETENTION_DAYS: u32 = 365;
@@ -96,11 +88,8 @@ pub struct TavilyKeyConfig {
     /// 此处仅作单进程实例生命周期内的异常失控应急防护。
     #[serde(default)]
     pub max_requests: Option<u64>,
-    /// Deprecated label (ADR-0003): the pool is flat and this schedules nothing.
-    #[serde(default)]
-    pub group: Option<String>,
     /// Deprecated: use `[upstream] rpm` — a per-key limit was never a thing,
-    /// the value only ever reached the group bucket it belonged to.
+    /// the value only ever reached the single upstream bucket.
     #[serde(default)]
     pub rpm: Option<u32>,
 }
@@ -110,7 +99,6 @@ impl TavilyKeyConfig {
         Self {
             key: key.into(),
             max_requests: None,
-            group: None,
             rpm: None,
         }
     }
@@ -202,43 +190,17 @@ impl Config {
         Ok(config)
     }
 
-    /// The pool, in the order the key lane serves it.
-    ///
-    /// Order is the one `[[groups]]` used to produce, so a config written for
-    /// lanes keeps the same key sequence and the same rotation: declared groups
-    /// in declaration order, each group's own keys first, then `[[tavily_keys]]`
-    /// appended to the lane it was tagged into (ungtagged keys to `default`).
+    /// The pool, in the order the key sequence serves it: the file's
+    /// declaration order.
     pub fn flatten_keys(&self) -> Vec<TavilyKeyConfig> {
-        self.flatten_lanes().into_iter().map(|k| k.0).collect()
-    }
-
-    fn flatten_lanes(&self) -> Vec<(TavilyKeyConfig, bool)> {
-        let mut lanes: Vec<(&str, Vec<(TavilyKeyConfig, bool)>)> = Vec::new();
-
-        for g in &self.groups {
-            let keys = g.keys.iter().cloned().map(|k| (k, true));
-            match lanes.iter_mut().find(|(name, _)| *name == g.name) {
-                Some((_, existing)) => existing.extend(keys),
-                None => lanes.push((g.name.as_str(), keys.collect())),
-            }
-        }
-
-        for tk in &self.tavily_keys {
-            let lane = tk.group.as_deref().unwrap_or("default");
-            match lanes.iter_mut().find(|(name, _)| *name == lane) {
-                Some((_, existing)) => existing.push((tk.clone(), false)),
-                None => lanes.push((lane, vec![(tk.clone(), false)])),
-            }
-        }
-
-        lanes.into_iter().flat_map(|(_, keys)| keys).collect()
+        self.tavily_keys.clone()
     }
 
     /// Size of the single upstream bucket, in requests per minute.
     ///
-    /// Explicit `[upstream] rpm` wins; otherwise the smallest deprecated
-    /// per-key/per-group `rpm` (a config that named several must not end up with
-    /// a bucket above any one of them); otherwise the first key's plan default.
+    /// Explicit `[upstream] rpm` wins; otherwise the smallest deprecated per-key
+    /// `rpm` (a config that named several must not end up with a bucket above
+    /// any one of them); otherwise the first key's plan default.
     pub fn resolve_upstream_rpm(&self) -> u32 {
         self.upstream_budget().0
     }
@@ -250,11 +212,7 @@ impl Config {
             return (rpm, "[upstream] rpm 显式设置");
         }
 
-        let deprecated = self
-            .groups
-            .iter()
-            .filter_map(|g| g.rpm)
-            .chain(self.tavily_keys.iter().filter_map(|k| k.rpm));
+        let deprecated = self.tavily_keys.iter().filter_map(|k| k.rpm);
         if let Some(min) = deprecated.min() {
             return (min, "已弃用 rpm 的最小值");
         }
@@ -272,35 +230,10 @@ impl Config {
     pub fn deprecations(&self) -> Vec<String> {
         let mut out = Vec::new();
 
-        if !self.groups.is_empty() {
-            out.push(format!(
-                "[[groups]] 已弃用（ADR-0003）：配置写了 {} 个组。上游按出口 IP 计限，分组不增加容量；\
-                 本版本起拍平为单池（顺序不变），组名仅作标签并告警，下一版将拒绝启动。预算请用 \
-                 [upstream] rpm 显式设置。",
-                self.groups.len()
-            ));
-        }
-
-        for g in &self.groups {
-            if g.rpm.is_some() {
-                out.push(format!(
-                    "[[groups]] \"{}\" 的 rpm 已弃用：只有一个桶（该出口 IP 的预算），\
-                     多组取值以最小值兜底；请改用 [upstream] rpm。",
-                    g.name
-                ));
-            }
-        }
-
         for (i, tk) in self.tavily_keys.iter().enumerate() {
-            if tk.group.is_some() {
-                out.push(format!(
-                    "tavily_keys[{i}].group 已弃用：池已平铺（ADR-0003），分组名不再参与调度，\
-                     请删除该字段。"
-                ));
-            }
             if tk.rpm.is_some() {
                 out.push(format!(
-                    "tavily_keys[{i}].rpm 已弃用：per-key 限速从未存在（值只流向它所在的组桶），\
+                    "tavily_keys[{i}].rpm 已弃用：per-key 限速从未存在（该值只作单桶预算下界），\
                      请改用 [upstream] rpm。"
                 ));
             }
@@ -310,7 +243,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        let flat = self.flatten_lanes();
+        let flat = self.flatten_keys();
         anyhow::ensure!(
             !flat.is_empty(),
             "at least one tavily key must be configured"
@@ -319,15 +252,10 @@ impl Config {
             !self.proxy_keys.is_empty(),
             "at least one proxy key must be configured"
         );
-        for (i, (tk, from_groups)) in flat.iter().enumerate() {
+        for (i, tk) in flat.iter().enumerate() {
             anyhow::ensure!(
                 tk.key.starts_with("tvly-"),
-                "tavily_keys[{i}]: key should start with 'tvly-'{}",
-                if *from_groups {
-                    "（来自已弃用的 [[groups]]，请移入 [[tavily_keys]]）"
-                } else {
-                    ""
-                }
+                "tavily_keys[{i}]: key should start with 'tvly-'"
             );
         }
         for (i, pk) in self.proxy_keys.iter().enumerate() {

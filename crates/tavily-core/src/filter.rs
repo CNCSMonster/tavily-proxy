@@ -372,8 +372,22 @@ pub struct FilterConfig {
     #[serde(default = "default_stages")]
     pub stages: Vec<Stage>,
     /// Score at or above which a unit is blocked instead of flagged.
+    ///
+    /// 这是**出参**阶段的默认阈值；入参阶段有自己的默认值
+    /// [`DEFAULT_INPUT_BLOCK_THRESHOLD`]，两者都可以用下面两个字段分别覆盖
+    /// （ISSUE-0004 分阶段差异化阈值）。
     #[serde(default = "default_block_threshold")]
     pub block_threshold: f64,
+    /// 入参（调用方自己的文本）的拦截阈值，覆盖入参阶段的默认值。
+    ///
+    /// 入参是调用方自己写的文本，信任级别高于不可信上游回包，
+    /// 因此默认比出参更难拦（0.95 vs0.8）——阈值按 stage 取值，
+    /// 不再让一个全链单值同时代表两种信任级别。
+    #[serde(default)]
+    pub input_block_threshold: Option<f64>,
+    /// 出参（不可信上游回包）的拦截阈值，覆盖 `block_threshold`。
+    #[serde(default)]
+    pub output_block_threshold: Option<f64>,
     #[serde(default)]
     pub on_error: FailMode,
     #[serde(default)]
@@ -431,6 +445,15 @@ fn default_stages() -> Vec<Stage> {
 fn default_block_threshold() -> f64 {
     0.8
 }
+
+/// 入参阶段的默认拦截阈值（ISSUE-0004）。
+///
+/// 0.95 而非0.8：入参是调用方自己的文本，误拦直接伤害调用方，
+/// 需要更高的确信度才拦。线上实测（2026-10 生产日志）：
+/// 入参拦截仅 9 例且 confidence 全部 ≥0.99，入参 flagged 为 0——
+/// 0.8~0.95 区间的样本全部来自出参，因此入参阈值抬到0.95 不改变
+/// 任何既有拦截行为，只把“入参 0.8~0.95 区间”从误拦风险中释放出来。
+pub const DEFAULT_INPUT_BLOCK_THRESHOLD: f64 = 0.95;
 
 fn default_enabled() -> bool {
     true
@@ -605,6 +628,9 @@ fn default_max_batch_chars() -> usize {
 pub struct FilterChain {
     filters: Vec<Box<dyn ContentFilter>>,
     block_threshold: f64,
+    /// 各阶段生效的拦截阈值（ISSUE-0004）：入参与出参信任级别不同，分开取值。
+    input_block_threshold: f64,
+    output_block_threshold: f64,
     on_error: FailMode,
     output_block: OutputBlockMode,
     scan_raw_content: bool,
@@ -619,6 +645,8 @@ impl std::fmt::Debug for FilterChain {
         f.debug_struct("FilterChain")
             .field("filters", &self.names())
             .field("block_threshold", &self.block_threshold)
+            .field("input_block_threshold", &self.input_block_threshold)
+            .field("output_block_threshold", &self.output_block_threshold)
             .field("on_error", &self.on_error)
             .field("output_block", &self.output_block)
             .field("scan_raw_content", &self.scan_raw_content)
@@ -637,6 +665,8 @@ impl FilterChain {
         Self {
             filters,
             block_threshold,
+            input_block_threshold: DEFAULT_INPUT_BLOCK_THRESHOLD,
+            output_block_threshold: block_threshold,
             on_error,
             output_block: OutputBlockMode::default(),
             scan_raw_content: false,
@@ -651,6 +681,37 @@ impl FilterChain {
     pub fn with_stages(mut self, stages: Vec<Stage>) -> Self {
         self.stages = stages;
         self
+    }
+
+    /// 按阶段覆盖拦截阈值（ISSUE-0004）；`None` 保持当前值。
+    pub fn with_stage_thresholds(
+        mut self,
+        input_block_threshold: Option<f64>,
+        output_block_threshold: Option<f64>,
+    ) -> Self {
+        if let Some(threshold) = input_block_threshold {
+            self.input_block_threshold = threshold;
+        }
+        if let Some(threshold) = output_block_threshold {
+            self.output_block_threshold = threshold;
+        }
+        self
+    }
+
+    /// 该阶段生效的拦截阈值：阶段专属值优先，否则退回各阶段默认。
+    pub fn stage_threshold(&self, stage: Stage) -> f64 {
+        match stage {
+            Stage::Input => self.input_block_threshold,
+            Stage::Output => self.output_block_threshold,
+        }
+    }
+
+    pub fn input_block_threshold(&self) -> f64 {
+        self.input_block_threshold
+    }
+
+    pub fn output_block_threshold(&self) -> f64 {
+        self.output_block_threshold
     }
 
     /// Whether the caller-controlled side is judged (off by default).
@@ -772,6 +833,20 @@ impl FilterChain {
             "filter.block_threshold must be a confidence between 0 and 1, got {}",
             config.block_threshold
         );
+        for (name, value) in [
+            ("filter.input_block_threshold", config.input_block_threshold),
+            (
+                "filter.output_block_threshold",
+                config.output_block_threshold,
+            ),
+        ] {
+            if let Some(value) = value {
+                anyhow::ensure!(
+                    (0.0..=1.0).contains(&value),
+                    "{name} must be a confidence between 0 and 1, got {value}"
+                );
+            }
+        }
         anyhow::ensure!(
             config.max_parallel_checks >= 1,
             "filter.max_parallel_checks must be at least 1, got {}",
@@ -818,6 +893,7 @@ impl FilterChain {
             .with_output_policy(config.output_block, config.scan_raw_content)
             .with_reporting(config.report_filtered, config.report_message.clone())
             .with_parallel_limit(config.max_parallel_checks)
+            .with_stage_thresholds(config.input_block_threshold, config.output_block_threshold)
             .with_stages(config.stages.clone()))
     }
 
@@ -827,7 +903,7 @@ impl FilterChain {
         self
     }
 
-    /// Run every filter against one unit.
+    /// Run every filter against one unit, at the proxy's default stage (output).
     ///
     /// Rules, in order:
     /// * `Pass` → next filter;
@@ -837,13 +913,16 @@ impl FilterChain {
     ///   a stricter filter still gets to escalate it to `Blocked`;
     /// * error → `Unavailable` under fail-closed, or recorded and skipped under
     ///   fail-open.
+    ///
+    /// The threshold is the stage's own (ISSUE-0004): input-stage runs must go
+    /// through [`run_many_counted`] with [`Stage::Input`] to get the input
+    /// threshold — this convenience form judges the default output stage.
     pub async fn run(&self, unit: ScanUnit<'_>) -> ChainResult {
         let mut results = self.run_many(std::slice::from_ref(&unit)).await;
         results.pop().expect("one unit in, one result out")
     }
 
-    /// Run the chain against a group of units, choosing a [`CheckPlan`] per
-    /// filter.
+    /// Run the chain against a group of units, at the default stage (output).
     ///
     /// The semantics are [`run`]'s, applied *per unit*: a unit a filter blocks
     /// (or that fails under fail-closed) leaves the chain immediately and never
@@ -851,15 +930,23 @@ impl FilterChain {
     /// one per unit, in input order — whatever plan ran. The plan is a
     /// performance decision only; verdicts are identical under every plan.
     pub async fn run_many(&self, units: &[ScanUnit<'_>]) -> Vec<ChainResult> {
-        self.run_many_counted(units).await.0
+        self.run_many_counted(units, Stage::Output).await.0
     }
 
-    /// [`Self::run_many`] plus how many checker invocations it took.
+    /// [`Self::run_many`] for one stage, plus how many checker invocations it took.
     ///
     /// `filter_calls` in the metrics log comes from here: it counts real
     /// calls (batches included), so a 10-result search that chunks into three
     /// batches reports 3, not 10.
-    pub async fn run_many_counted(&self, units: &[ScanUnit<'_>]) -> (Vec<ChainResult>, u32) {
+    ///
+    /// `stage` selects which threshold decides `Blocked` vs `Flagged`
+    /// (ISSUE-0004): input and output carry different trust levels, so each
+    /// has its own threshold.
+    pub async fn run_many_counted(
+        &self,
+        units: &[ScanUnit<'_>],
+        stage: Stage,
+    ) -> (Vec<ChainResult>, u32) {
         /// What the chain accumulates for one unit while filters run.
         struct UnitState {
             checked: Vec<String>,
@@ -878,6 +965,7 @@ impl FilterChain {
             })
             .collect();
         let mut total_calls = 0u32;
+        let threshold = self.stage_threshold(stage);
 
         for filter in &self.filters {
             // Units a previous filter already decided about do not move on —
@@ -908,7 +996,7 @@ impl FilterChain {
                         confidence,
                     }) => {
                         state.checked.push(filter.name().to_string());
-                        if confidence >= self.block_threshold {
+                        if confidence >= threshold {
                             state.terminal = Some(ChainVerdict::Blocked {
                                 filter: filter.name().to_string(),
                                 message,

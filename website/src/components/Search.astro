@@ -1,0 +1,373 @@
+---
+// 内联 SVG，无需外部依赖
+---
+
+<site-search class={Astro.props.class}>
+	<button
+		type="button"
+		class="orama-search-button"
+		data-open-modal
+		aria-label="搜索文档"
+		aria-keyshortcuts="Control+K"
+	>
+		<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+			<path d="M21.71 20.29 18 16.61A9 9 0 1 0 16.61 18l3.68 3.68a.999.999 0 0 0 1.42 0 1 1 0 0 0 0-1.39ZM11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14Z"/>
+		</svg>
+		<span class="search-label">搜索文档 (Orama)</span>
+		<kbd class="search-kbd">Ctrl K</kbd>
+	</button>
+
+	<dialog id="orama-search-dialog" class="orama-dialog">
+		<div class="orama-dialog-box">
+			<div class="orama-search-header">
+				<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" class="search-header-icon">
+					<path d="M21.71 20.29 18 16.61A9 9 0 1 0 16.61 18l3.68 3.68a.999.999 0 0 0 1.42 0 1 1 0 0 0 0-1.39ZM11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14Z"/>
+				</svg>
+				<input
+					id="orama-search-input"
+					type="text"
+					placeholder="搜索笔记标题、内容或概念... (Esc 关闭)"
+					autocomplete="off"
+				/>
+				<button type="button" class="orama-close-btn" data-close-modal title="关闭">
+					✕
+				</button>
+			</div>
+
+			<div id="orama-search-results" class="orama-search-results">
+				<div class="orama-empty-state">输入关键词开始全库增量检索</div>
+			</div>
+
+			<div class="orama-search-footer">
+				<span><kbd>↑</kbd> <kbd>↓</kbd> 切换结果</span>
+				<span><kbd>Enter</kbd> 跳转</span>
+				<span><kbd>Esc</kbd> 关闭</span>
+				<span class="orama-badge">Orama 增量内存索引</span>
+			</div>
+		</div>
+	</dialog>
+</site-search>
+
+<script>
+	class SiteSearch extends HTMLElement {
+		constructor() {
+			super();
+			const openBtn = this.querySelector('[data-open-modal]');
+			const closeBtn = this.querySelector('[data-close-modal]');
+			const dialog = this.querySelector('dialog');
+			const input = this.querySelector('#orama-search-input');
+			const resultsContainer = this.querySelector('#orama-search-results');
+			let activeIndex = -1;
+			let debounceTimer = null;
+
+			const openDialog = () => {
+				dialog.showModal();
+				document.body.style.overflow = 'hidden';
+				input.focus();
+				input.select();
+			};
+
+			const closeDialog = () => {
+				dialog.close();
+				document.body.style.overflow = '';
+			};
+
+			openBtn?.addEventListener('click', openDialog);
+			closeBtn?.addEventListener('click', closeDialog);
+
+			dialog.addEventListener('click', (e) => {
+				if (e.target === dialog) closeDialog();
+			});
+
+			window.addEventListener('keydown', (e) => {
+				if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+					e.preventDefault();
+					dialog.open ? closeDialog() : openDialog();
+				}
+				if (e.key === 'Escape' && dialog.open) {
+					closeDialog();
+				}
+			});
+
+			const renderResults = (hits) => {
+				if (!hits || hits.length === 0) {
+					resultsContainer.innerHTML = '<div class="orama-empty-state">未找到匹配笔记</div>';
+					activeIndex = -1;
+					return;
+				}
+
+				activeIndex = 0;
+				resultsContainer.innerHTML = hits.map((hit, idx) => `
+					<a href="${hit.url}" class="orama-result-item ${idx === 0 ? 'active' : ''}" data-idx="${idx}">
+						<div class="orama-result-top">
+							<span class="orama-category-tag">${hit.category}</span>
+							<span class="orama-title">${hit.title}</span>
+						</div>
+						${hit.snippet ? `<div class="orama-snippet">${hit.snippet}</div>` : ''}
+					</a>
+				`).join('');
+
+				resultsContainer.querySelectorAll('.orama-result-item').forEach((item) => {
+					item.addEventListener('mouseenter', () => {
+						resultsContainer.querySelectorAll('.orama-result-item').forEach(i => i.classList.remove('active'));
+						item.classList.add('active');
+						activeIndex = parseInt(item.dataset.idx, 10);
+					});
+				});
+			};
+
+			input?.addEventListener('input', (e) => {
+				const term = e.target.value.trim();
+				clearTimeout(debounceTimer);
+				if (!term) {
+					resultsContainer.innerHTML = '<div class="orama-empty-state">输入关键词开始全库增量检索</div>';
+					return;
+				}
+
+				debounceTimer = setTimeout(async () => {
+					try {
+						const res = await fetch('/api/search?q=' + encodeURIComponent(term));
+						if (!res.ok) return;
+						const hits = await res.json();
+						renderResults(hits);
+					} catch (err) {
+						console.error('Search error:', err);
+					}
+				}, 100);
+			});
+
+			input?.addEventListener('keydown', (e) => {
+				const items = resultsContainer.querySelectorAll('.orama-result-item');
+				if (items.length === 0) return;
+
+				if (e.key === 'ArrowDown') {
+					e.preventDefault();
+					activeIndex = (activeIndex + 1) % items.length;
+					updateActiveItem(items);
+				} else if (e.key === 'ArrowUp') {
+					e.preventDefault();
+					activeIndex = (activeIndex - 1 + items.length) % items.length;
+					updateActiveItem(items);
+				} else if (e.key === 'Enter') {
+					e.preventDefault();
+					if (activeIndex >= 0 && items[activeIndex]) {
+						items[activeIndex].click();
+					}
+				}
+			});
+
+			const updateActiveItem = (items) => {
+				items.forEach((item, idx) => {
+					if (idx === activeIndex) {
+						item.classList.add('active');
+						item.scrollIntoView({ block: 'nearest' });
+					} else {
+						item.classList.remove('active');
+					}
+				});
+			};
+		}
+	}
+
+	customElements.define('site-search', SiteSearch);
+</script>
+
+<style>
+	site-search {
+		display: contents;
+	}
+
+	.orama-search-button {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		border: 1px solid var(--sl-color-gray-5);
+		background-color: var(--sl-color-black);
+		color: var(--sl-color-gray-2);
+		cursor: pointer;
+		height: 2.375rem;
+		padding: 0 0.875rem;
+		border-radius: 0.5rem;
+		font-size: var(--sl-text-sm);
+		transition: border-color 0.15s ease;
+		width: 100%;
+		max-width: 20rem;
+	}
+
+	.orama-search-button:hover {
+		border-color: var(--sl-color-accent);
+		color: var(--sl-color-white);
+	}
+
+	.search-label {
+		flex: 1;
+		text-align: left;
+	}
+
+	.search-kbd {
+		background: var(--sl-color-gray-6);
+		border-radius: 0.25rem;
+		padding: 0.15rem 0.4rem;
+		font-size: var(--sl-text-2xs);
+		color: var(--sl-color-gray-3);
+	}
+
+	.orama-dialog {
+		margin: 5vh auto auto;
+		border: none;
+		background: transparent;
+		padding: 0;
+		max-width: 44rem;
+		width: 90vw;
+		overflow: visible;
+	}
+
+	.orama-dialog::backdrop {
+		background: rgba(0, 0, 0, 0.65);
+		backdrop-filter: blur(4px);
+	}
+
+	.orama-dialog-box {
+		background: var(--sl-color-gray-6);
+		border: 1px solid var(--sl-color-gray-5);
+		border-radius: 0.75rem;
+		box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+		display: flex;
+		flex-direction: column;
+		max-height: 80vh;
+		overflow: hidden;
+	}
+
+	.orama-search-header {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		padding: 0.875rem 1.25rem;
+		border-bottom: 1px solid var(--sl-color-gray-5);
+	}
+
+	.search-header-icon {
+		color: var(--sl-color-gray-3);
+	}
+
+	.orama-search-header input {
+		flex: 1;
+		background: transparent;
+		border: none;
+		outline: none;
+		color: var(--sl-color-white);
+		font-size: 1.05rem;
+	}
+
+	.orama-close-btn {
+		background: transparent;
+		border: none;
+		color: var(--sl-color-gray-3);
+		cursor: pointer;
+		font-size: 1rem;
+		padding: 0.25rem 0.5rem;
+		border-radius: 0.25rem;
+	}
+
+	.orama-close-btn:hover {
+		color: var(--sl-color-white);
+		background: var(--sl-color-gray-5);
+	}
+
+	.orama-search-results {
+		flex: 1;
+		overflow-y: auto;
+		padding: 0.5rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.35rem;
+		min-height: 12rem;
+		max-height: 55vh;
+	}
+
+	.orama-empty-state {
+		margin: auto;
+		padding: 3rem 1rem;
+		text-align: center;
+		color: var(--sl-color-gray-3);
+		font-size: var(--sl-text-sm);
+	}
+
+	.orama-result-item {
+		display: block;
+		padding: 0.75rem 1rem;
+		border-radius: 0.5rem;
+		text-decoration: none;
+		color: inherit;
+		border: 1px solid transparent;
+		transition: background 0.1s ease, border-color 0.1s ease;
+	}
+
+	.orama-result-item:hover,
+	.orama-result-item.active {
+		background: var(--sl-color-gray-5);
+		border-color: var(--sl-color-accent);
+	}
+
+	.orama-result-top {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		margin-bottom: 0.25rem;
+	}
+
+	.orama-category-tag {
+		font-size: 0.75rem;
+		padding: 0.1rem 0.4rem;
+		border-radius: 0.25rem;
+		background: var(--sl-color-black);
+		color: var(--sl-color-accent-high);
+		font-weight: 500;
+	}
+
+	.orama-title {
+		font-weight: 600;
+		color: var(--sl-color-white);
+		font-size: 0.95rem;
+	}
+
+	.orama-snippet {
+		font-size: 0.825rem;
+		color: var(--sl-color-gray-2);
+		line-height: 1.4;
+		margin-top: 0.2rem;
+		white-space: normal;
+		word-break: break-all;
+	}
+
+	.orama-snippet :global(mark) {
+		background: rgba(255, 213, 0, 0.25);
+		color: #ffd000;
+		font-weight: 600;
+		padding: 0 0.15rem;
+		border-radius: 0.15rem;
+	}
+
+	.orama-search-footer {
+		display: flex;
+		align-items: center;
+		gap: 1rem;
+		padding: 0.625rem 1.25rem;
+		border-top: 1px solid var(--sl-color-gray-5);
+		background: var(--sl-color-black);
+		font-size: 0.75rem;
+		color: var(--sl-color-gray-3);
+	}
+
+	.orama-search-footer kbd {
+		background: var(--sl-color-gray-6);
+		padding: 0.1rem 0.3rem;
+		border-radius: 0.2rem;
+		color: var(--sl-color-gray-2);
+	}
+
+	.orama-badge {
+		margin-left: auto;
+		color: var(--sl-color-accent-high);
+	}
+</style>
