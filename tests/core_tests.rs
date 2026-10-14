@@ -4937,7 +4937,8 @@ fn run_check(config_text: &str) -> (i32, String, String) {
             target.join("tavily-proxy")
         });
 
-    if !bin_path.exists() {
+    static BUILD_ONCE: std::sync::Once = std::sync::Once::new();
+    BUILD_ONCE.call_once(|| {
         let status = std::process::Command::new("cargo")
             .args(["build", "-p", "tavily-proxy"])
             .status()
@@ -4946,7 +4947,7 @@ fn run_check(config_text: &str) -> (i32, String, String) {
             status.success(),
             "failed to build tavily-proxy for check tests"
         );
-    }
+    });
 
     let output = std::process::Command::new(bin_path)
         .args(["check", "--config"])
