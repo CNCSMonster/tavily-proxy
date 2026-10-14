@@ -52,8 +52,10 @@ const siteTitle = process.env.SITE_TITLE || 'Tavily Proxy 用户手册';
 
 // https://astro.build/config
 export default defineConfig({
+  site: 'https://cncsmonster.github.io',
+  base: '/tavily-proxy',
   redirects: {
-    '/': '/01-overview',
+    '/': '/tavily-proxy/01-overview',
   },
   server: {
     port: 4400,
